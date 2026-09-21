@@ -103,6 +103,56 @@
         box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.25) inset;
       }
 
+      /* Small round close/quit button */
+      #closeAppButton {
+        width: 26px;
+        height: 26px;
+        border-radius: 9999px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        flex-shrink: 0;
+      }
+      #closeAppButton i { font-size: 13px; }
+      #closeAppButton:hover {
+        background: rgba(255, 71, 87, 0.2);
+        color: #ff4757;
+        box-shadow: 0 0 0 1px rgba(255, 71, 87, 0.3) inset;
+      }
+
+      /* Small round Japanese-romaji-mode toggle button */
+      #japaneseModeButton {
+        width: 26px;
+        height: 26px;
+        border-radius: 9999px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        flex-shrink: 0;
+      }
+      #japaneseModeButton i {
+        font-size: 12px;
+        font-style: normal;
+        font-weight: 700;
+      }
+      #japaneseModeButton:hover {
+        background: rgba(96, 165, 250, 0.18);
+        color: #93c5fd;
+        box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.25) inset;
+      }
+      /* Unambiguous on-state — a filled background, not just a text-color
+         change, so it's never unclear at a glance whether it's active. */
+      #japaneseModeButton.active {
+        background: rgba(76, 175, 80, 0.25);
+        color: #4caf50;
+        box-shadow: 0 0 0 1px rgba(76, 175, 80, 0.4) inset;
+      }
+      #japaneseModeButton.active:hover {
+        background: rgba(76, 175, 80, 0.35);
+      }
+
       .command-separator {
         width: 1px;
         height: 16px;
@@ -153,26 +203,6 @@
 
       .hidden-indicator.show {
         opacity: 1;
-      }
-
-      #skillIndicator {
-        color: #ffffff;
-        transition: all 0.3s ease;
-      }
-
-      #skillIndicator:hover {
-        color: #ffffff;
-      }
-
-      #skillIndicator.non-interactive {
-        color: #ffffff;
-        opacity: 0.7;
-      }
-
-      #skillIndicator.non-interactive:hover {
-        background: rgba(76, 175, 80, 0.05);
-        border-color: rgba(76, 175, 80, 0.15);
-        color: #ffffff;
       }
 
       #settingsIndicator {
@@ -362,20 +392,18 @@
         <i class="fas fa-microphone"></i>
       </div>
       <div class="command-separator"></div>
-      <div class="command-item" id="skillIndicator">
-        <i class="fas fa-brain"></i>
-        <span>DSA</span>
-      </div>
-      <div class="command-separator"></div>
       <div class="command-item" id="languageSelector">
         <i class="fas fa-code"></i>
         <select id="codingLanguage">
-          <option value="cpp">C++</option>
-          <option value="c">C</option>
+          <option value="kotlin">Kotlin</option>
           <option value="python">Python</option>
           <option value="java">Java</option>
           <option value="javascript">JavaScript</option>
         </select>
+      </div>
+      <div class="command-separator"></div>
+      <div class="command-item" id="japaneseModeButton" title="Japanese (romaji) response mode">
+        <i>JP</i>
       </div>
       <div class="command-separator"></div>
       <div class="command-item" id="infoButton" title="Shortcuts">
@@ -383,6 +411,10 @@
       </div>
       <div class="command-separator"></div>
       <div class="status-dot non-interactive" id="statusDot"></div>
+      <div class="command-separator"></div>
+      <div class="command-item" id="closeAppButton" title="Quit OpenCluely">
+        <i class="fas fa-xmark"></i>
+      </div>
     </div>
 
   <!-- Shortcuts Popover (hidden by default via CSS) -->

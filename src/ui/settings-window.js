@@ -17,10 +17,17 @@ document.addEventListener('DOMContentLoaded', () => {
     const whisperResponseTargetSelect = document.getElementById('whisperResponseTarget');
     const whisperSegmentMsInput = document.getElementById('whisperSegmentMs');
     const geminiKeyInput = document.getElementById('geminiKey');
+    const geminiModelSelect = document.getElementById('geminiModel');
     const windowGapInput = document.getElementById('windowGap');
     const codingLanguageSelect = document.getElementById('codingLanguage');
-    const activeSkillSelect = document.getElementById('activeSkill');
     const iconGrid = document.getElementById('iconGrid');
+    const resumeProfileSelect = document.getElementById('resumeProfile');
+    const resumeContextInput = document.getElementById('resumeContext');
+    const uploadResumeBtn = document.getElementById('uploadResumeBtn');
+    const clearResumeBtn = document.getElementById('clearResumeBtn');
+    const resumeStatus = document.getElementById('resumeStatus');
+    const japaneseModeSelect = document.getElementById('japaneseMode');
+    const interviewMetadataInput = document.getElementById('interviewMetadata');
 
     // Check if window.api exists
     if (!window.api) {
@@ -88,14 +95,20 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperResponseTargetSelect) whisperResponseTargetSelect.value = settings.whisperResponseTarget || 'both';
         if (whisperSegmentMsInput) whisperSegmentMsInput.value = settings.whisperSegmentMs || '';
         if (geminiKeyInput) geminiKeyInput.value = settings.geminiKey || '';
+        if (geminiModelSelect) geminiModelSelect.value = settings.geminiModel || 'gemini-3.1-flash-lite';
         if (windowGapInput) windowGapInput.value = settings.windowGap || '';
 
-        // Set C++ as default if no coding language is specified
+        // Set Kotlin as default if no coding language is specified, or if a
+        // stored value (e.g. 'cpp'/'c') is no longer a valid option.
         if (codingLanguageSelect) {
-            codingLanguageSelect.value = settings.codingLanguage || 'cpp';
+            const validLanguages = Array.from(codingLanguageSelect.options).map(o => o.value);
+            codingLanguageSelect.value = validLanguages.includes(settings.codingLanguage) ? settings.codingLanguage : 'kotlin';
         }
 
-        if (settings.activeSkill && activeSkillSelect) activeSkillSelect.value = settings.activeSkill;
+        if (resumeProfileSelect) resumeProfileSelect.value = settings.resumeProfile || 'android';
+        if (resumeContextInput) resumeContextInput.value = settings.resumeContext || '';
+        if (japaneseModeSelect) japaneseModeSelect.value = settings.japaneseMode ? 'on' : 'off';
+        if (interviewMetadataInput) interviewMetadataInput.value = settings.interviewMetadata || '';
 
         // Handle icon selection
         const selectedIcon = settings.selectedIcon || settings.appIcon;
@@ -131,6 +144,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 console.log('Language updated from overlay window:', data.language);
             }
     });
+
+    // Listen for Japanese-mode changes from the bar button so this select
+    // can't drift out of sync with it.
+    window.electronAPI.onJapaneseModeChanged((event, data) => {
+            if (data && typeof data.enabled === 'boolean' && japaneseModeSelect) {
+                japaneseModeSelect.value = data.enabled ? 'on' : 'off';
+            }
+    });
     }
 
     // Save settings helper function
@@ -147,12 +168,89 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperResponseTargetSelect) settings.whisperResponseTarget = whisperResponseTargetSelect.value;
         if (whisperSegmentMsInput) settings.whisperSegmentMs = whisperSegmentMsInput.value;
         if (geminiKeyInput) settings.geminiKey = geminiKeyInput.value;
+        if (geminiModelSelect) settings.geminiModel = geminiModelSelect.value;
         if (windowGapInput) settings.windowGap = windowGapInput.value;
         if (codingLanguageSelect) settings.codingLanguage = codingLanguageSelect.value;
-        if (activeSkillSelect) settings.activeSkill = activeSkillSelect.value;
-        
+        if (resumeProfileSelect) settings.resumeProfile = resumeProfileSelect.value;
+        if (resumeContextInput) settings.resumeContext = resumeContextInput.value;
+        if (japaneseModeSelect) settings.japaneseMode = japaneseModeSelect.value === 'on';
+        if (interviewMetadataInput) settings.interviewMetadata = interviewMetadataInput.value;
+
         window.api.send('save-settings', settings);
     };
+
+    // Resume profile switch — saved on its own (not via the generic
+    // saveSettings() helper, which would also send the textarea's current
+    // value and could overwrite the newly-selected profile's saved resume
+    // with whatever was still showing from the previous one). After saving,
+    // reload settings so the textarea shows the new profile's own content.
+    if (resumeProfileSelect) {
+        resumeProfileSelect.addEventListener('change', async (e) => {
+            if (!window.electronAPI || !window.electronAPI.saveSettings || !window.electronAPI.getSettings) return;
+            await window.electronAPI.saveSettings({ resumeProfile: e.target.value });
+            const settings = await window.electronAPI.getSettings();
+            if (resumeContextInput) resumeContextInput.value = settings.resumeContext || '';
+            resumeStatus.textContent = '';
+        });
+    }
+
+    // Resume/background: upload a file, or edit the textarea directly.
+    if (uploadResumeBtn) {
+        uploadResumeBtn.addEventListener('click', async () => {
+            if (!window.electronAPI || !window.electronAPI.uploadResumeFile) return;
+            resumeStatus.textContent = 'Reading file...';
+            try {
+                const result = await window.electronAPI.uploadResumeFile();
+                if (result.canceled) {
+                    resumeStatus.textContent = '';
+                    return;
+                }
+                if (!result.success) {
+                    resumeStatus.textContent = `Error: ${result.error || 'Failed to read file'}`;
+                    return;
+                }
+                if (resumeContextInput) resumeContextInput.value = result.text;
+                resumeStatus.textContent = `Loaded from ${result.fileName}`;
+            } catch (error) {
+                resumeStatus.textContent = `Error: ${error.message}`;
+            }
+        });
+    }
+
+    if (clearResumeBtn) {
+        clearResumeBtn.addEventListener('click', () => {
+            if (resumeContextInput) resumeContextInput.value = '';
+            resumeStatus.textContent = 'Cleared';
+            saveSettings();
+        });
+    }
+
+    if (resumeContextInput) {
+        resumeContextInput.addEventListener('blur', () => {
+            saveSettings();
+            resumeStatus.textContent = 'Saved';
+        });
+    }
+
+    if (interviewMetadataInput) {
+        interviewMetadataInput.addEventListener('blur', () => {
+            saveSettings();
+        });
+    }
+
+    // Japanese mode — saved immediately on change (via electronAPI, not the
+    // generic window.api.send path, so main.js's saveSettings() branch that
+    // broadcasts 'japanese-mode-changed' fires right away and the bar
+    // button's own toggle handler can't drift out of sync with this select).
+    if (japaneseModeSelect) {
+        japaneseModeSelect.addEventListener('change', (e) => {
+            if (window.electronAPI && window.electronAPI.saveSettings) {
+                window.electronAPI.saveSettings({ japaneseMode: e.target.value === 'on' });
+            } else {
+                saveSettings();
+            }
+        });
+    }
 
     const updateSpeechFieldStates = () => {
         const provider = speechProviderSelect ? speechProviderSelect.value : 'azure';
@@ -196,6 +294,7 @@ document.addEventListener('DOMContentLoaded', () => {
         whisperResponseTargetSelect,
         whisperSegmentMsInput,
         geminiKeyInput,
+        geminiModelSelect,
         windowGapInput
     ];
 
@@ -224,15 +323,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 // fallback
                 saveSettings();
             }
-        });
-    }
-
-    // Skill selection handler
-    if (activeSkillSelect) {
-        activeSkillSelect.addEventListener('change', (e) => {
-            saveSettings();
-            // Also update the main window
-            window.api.send('update-skill', e.target.value);
         });
     }
 

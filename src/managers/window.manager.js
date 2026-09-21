@@ -38,7 +38,12 @@ class WindowManager {
     
     this.windowConfigs = {
       main: {
-        width: 520,
+        // 520 was the original cap; 600 accounted for the close/quit button;
+        // now +1 more item (the Japanese-mode toggle) needs headroom again —
+        // both the BrowserWindow's maxWidth (below) and the resize-window
+        // IPC clamp in main.js read this same value, so an undersized cap
+        // clips new bar items outside the window's visible bounds.
+        width: 680,
         height: 35,
         useContentSize: true,
         file: 'index.html',
@@ -119,6 +124,7 @@ class WindowManager {
       await this.createSettingsWindow();
       
       this.setupWindowEventHandlers();
+      this.attachWindowMoveSync();
       this.setupScreenTracking();
       this.setupScreenCaptureAvailabilityWatcher();
 
@@ -921,6 +927,70 @@ class WindowManager {
         logger.debug('Window restored', { type });
       });
     });
+  }
+
+  // Keep the main bar and the AI Response window moving together when
+  // either one is *natively* dragged (the '-webkit-app-region: drag'
+  // header on each). moveBoundWindows()/positionBoundWindows() already
+  // handle keyboard-driven movement and initial placement, but neither
+  // fires during an OS-level mouse drag — that has zero JS involvement by
+  // default, which is why dragging one window previously left the other
+  // behind. Electron's BrowserWindow emits a 'move' event continuously
+  // during a drag (and on any setPosition() call, including our own), so
+  // each window's 'move' handler repositions the other to keep the same
+  // stacked layout as positionBoundWindows().
+  attachWindowMoveSync() {
+    const mainWindow = this.windows.get('main');
+    const llmWindow = this.windows.get('llmResponse');
+    if (!mainWindow || !llmWindow) {
+      logger.warn('attachWindowMoveSync: main/llmResponse window missing, skipping');
+      return;
+    }
+
+    this._syncingWindowMove = false;
+
+    const clampX = (x, width) => {
+      const display = this.currentDisplay || screen.getPrimaryDisplay();
+      const { x: displayX, width: screenWidth } = display.workArea || display.workAreaSize;
+      return Math.max(displayX, Math.min(displayX + screenWidth - width, x));
+    };
+
+    // Setting the other window's position below re-fires its own 'move'
+    // event (synchronously on some platforms, on the next tick on others).
+    // _syncingWindowMove is set before that call and only cleared via
+    // setImmediate — deferred past the current event-loop turn — so
+    // whichever way the re-entrant event arrives, it lands while the guard
+    // is still up and is dropped instead of ping-ponging back and forth.
+    mainWindow.on('move', () => {
+      if (this._syncingWindowMove || !this.bindWindows) return;
+      const llm = this.windows.get('llmResponse');
+      if (!llm || llm.isDestroyed()) return;
+      this._syncingWindowMove = true;
+      const [mainX, mainY] = mainWindow.getPosition();
+      const [, mainHeight] = mainWindow.getSize();
+      const [llmWidth] = llm.getSize();
+      const llmX = clampX(mainX, llmWidth);
+      const llmY = mainY + mainHeight + this.windowGap;
+      llm.setPosition(llmX, llmY);
+      this.boundWindowsPosition = { x: mainX, y: mainY };
+      setImmediate(() => { this._syncingWindowMove = false; });
+    });
+
+    llmWindow.on('move', () => {
+      if (this._syncingWindowMove || !this.bindWindows) return;
+      const main = this.windows.get('main');
+      if (!main || main.isDestroyed()) return;
+      this._syncingWindowMove = true;
+      const [llmX, llmY] = llmWindow.getPosition();
+      const [mainWidth, mainHeight] = main.getSize();
+      const mainX = clampX(llmX, mainWidth);
+      const mainY = llmY - mainHeight - this.windowGap;
+      main.setPosition(mainX, mainY);
+      this.boundWindowsPosition = { x: mainX, y: mainY };
+      setImmediate(() => { this._syncingWindowMove = false; });
+    });
+
+    logger.info('Window move-sync attached (main <-> llmResponse)');
   }
 
   setupScreenCaptureAvailabilityWatcher() {

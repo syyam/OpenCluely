@@ -8,7 +8,7 @@ class SessionManager {
     this.compressionEnabled = true;
     this.maxSize = config.get('session.maxMemorySize');
     this.compressionThreshold = config.get('session.compressionThreshold');
-    this.currentSkill = 'dsa'; // Default skill is DSA
+    this.currentSkill = 'android'; // Default skill/resume-profile is Android
     this.isInitialized = false;
     
     this.initializeWithSkillPrompts();
@@ -227,15 +227,18 @@ class SessionManager {
    * Get skill-specific context with optional programming language support
    * @param {string|null} skillName - Target skill name (defaults to current skill)
    * @param {string|null} programmingLanguage - Optional programming language for injection
+   * @param {string|null} questionText - The actual question, used only to decide whether
+   *   the resume/interview-metadata blocks are worth including (see
+   *   candidate-context.js's isPersonalContextRelevant).
    */
-  getSkillContext(skillName = null, programmingLanguage = null) {
+  getSkillContext(skillName = null, programmingLanguage = null, questionText = null) {
     const targetSkill = skillName || this.currentSkill;
-    
+
     // Get skill prompt with programming language injection if provided
     let skillPrompt = null;
     if (programmingLanguage && promptLoader.requiresProgrammingLanguage(targetSkill)) {
       // Use prompt loader to get language-enhanced prompt
-      skillPrompt = promptLoader.getSkillPrompt(targetSkill, programmingLanguage);
+      skillPrompt = promptLoader.getSkillPrompt(targetSkill, programmingLanguage, questionText);
     } else {
       // Find skill prompt from session memory (fallback)
       const skillPromptEvent = this.sessionMemory.find(event => 

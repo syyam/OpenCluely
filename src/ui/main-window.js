@@ -10,9 +10,7 @@ class MainWindowUI {
     constructor() {
         this.isInteractive = false;
         this.isHidden = false;
-        this.currentSkill = 'dsa'; // Default, will be updated from settings
         this.statusDot = null;
-        this.skillIndicator = null;
         this.micButton = null;
         this.isRecording = false;
         this.speechAvailable = false; // track availability
@@ -22,12 +20,7 @@ class MainWindowUI {
         this._mediaStream = null;
         this._scriptNode = null;
         this._captureInterval = null;
-        
-        // Define available skills for navigation
-        this.availableSkills = [
-            'dsa'
-        ];
-        
+
         this.init();
     }
 
@@ -35,23 +28,21 @@ class MainWindowUI {
         try {
             this.setupElements();
             this.setupEventListeners();
-            
-            // Load current skill from settings
-            await this.loadCurrentSkill();
-            
+
             // Load current interaction state
             await this.loadCurrentInteractionState();
-            
+
             // Fetch speech availability
             await this.loadSpeechAvailability();
-            
-            this.updateSkillIndicator();
+
+            // Reflect the persisted Japanese-mode state on the bar button
+            await this.loadJapaneseModeState();
+
             this.updateAllElementStates(); // Update all elements with current state
             this.resizeWindowToContent();
-            
+
             logger.info('Main window UI initialized', {
                 component: 'MainWindowUI',
-                skill: this.currentSkill,
                 interactive: this.isInteractive
             });
 
@@ -63,26 +54,6 @@ class MainWindowUI {
             
         } catch (error) {
             logger.error('Failed to initialize main window UI', {
-                component: 'MainWindowUI',
-                error: error.message
-            });
-        }
-    }
-
-    async loadCurrentSkill() {
-        try {
-            if (window.electronAPI && window.electronAPI.getSettings) {
-                const settings = await window.electronAPI.getSettings();
-                if (settings && settings.activeSkill) {
-                    this.currentSkill = settings.activeSkill;
-                    logger.debug('Loaded current skill from settings', {
-                        component: 'MainWindowUI',
-                        skill: this.currentSkill
-                    });
-                }
-            }
-        } catch (error) {
-            logger.warn('Failed to load current skill from settings', {
                 component: 'MainWindowUI',
                 error: error.message
             });
@@ -109,6 +80,19 @@ class MainWindowUI {
                 component: 'MainWindowUI',
                 error: error.message
             });
+        }
+    }
+
+    async loadJapaneseModeState() {
+        try {
+            if (window.electronAPI && window.electronAPI.getSettings) {
+                const settings = await window.electronAPI.getSettings();
+                if (this.japaneseModeButton) {
+                    this.japaneseModeButton.classList.toggle('active', !!settings.japaneseMode);
+                }
+            }
+        } catch (_) {
+            // Default: off. Not fatal — the button just starts unhighlighted.
         }
     }
 
@@ -139,7 +123,6 @@ class MainWindowUI {
     updateAllElementStates() {
         // Update all interactive elements with current state
         this.updateStatusDot();
-        this.updateSkillIndicatorState();
         this.updateMicButtonState();
         this.updateSettingsIndicatorState();
     }
@@ -169,26 +152,6 @@ class MainWindowUI {
             });
         } else {
             logger.error('Status dot element not found');
-        }
-    }
-
-    updateSkillIndicatorState() {
-        if (this.skillIndicator) {
-            // Remove both classes first
-            this.skillIndicator.classList.remove('interactive', 'non-interactive');
-            
-            // Add the appropriate class
-            if (this.isInteractive) {
-                this.skillIndicator.classList.add('interactive');
-            } else {
-                this.skillIndicator.classList.add('non-interactive');
-            }
-            
-            logger.debug('Skill indicator state updated', {
-                component: 'MainWindowUI',
-                interactive: this.isInteractive,
-                classes: this.skillIndicator.className
-            });
         }
     }
 
@@ -267,17 +230,18 @@ class MainWindowUI {
 
     setupElements() {
         this.statusDot = document.getElementById('statusDot');
-        this.skillIndicator = document.getElementById('skillIndicator');
         this.settingsIndicator = document.getElementById('settingsIndicator'); // Optional
         this.micButton = document.getElementById('micButton');
     this.infoButton = document.getElementById('infoButton');
     this.shortcutsPopover = document.getElementById('shortcutsPopover');
+    this.closeAppButton = document.getElementById('closeAppButton');
+    this.japaneseModeButton = document.getElementById('japaneseModeButton');
 
         // NEW: Screenshot button is the first .command-item without id
         const commandItems = document.querySelectorAll('.command-item');
         this.screenshotButton = commandItems && commandItems[0];
 
-    if (!this.statusDot || !this.skillIndicator || !this.micButton || !this.screenshotButton) {
+    if (!this.statusDot || !this.micButton || !this.screenshotButton) {
             throw new Error('Required UI elements not found');
         }
 
@@ -288,18 +252,40 @@ class MainWindowUI {
             }
         });
 
-        // Skill indicator click handler toggles DSA skill
-        this.skillIndicator.addEventListener('click', () => {
-            if (!this.isInteractive) return;
-            const newSkill = 'dsa';
-            if (window.electronAPI && window.electronAPI.updateActiveSkill) {
-                window.electronAPI.updateActiveSkill(newSkill).then(() => {
-                    this.handleSkillActivated(newSkill);
-                });
-            } else {
-                this.handleSkillActivated(newSkill);
-            }
-        });
+        // Close/quit button — ends the session and quits the app. The
+        // 'quit-app' IPC path (main.js) already triggers Electron's
+        // 'will-quit' event, which shuts down the persistent Whisper worker
+        // (src/services/whisper-worker.service.js close()) and kills its
+        // Python subprocess, releasing CUDA/VRAM — no extra cleanup needed
+        // here beyond calling it.
+        if (this.closeAppButton) {
+            this.closeAppButton.addEventListener('click', () => {
+                if (!this.isInteractive) return;
+                if (window.electronAPI && window.electronAPI.quit) {
+                    window.electronAPI.quit();
+                }
+            });
+        }
+
+        // Japanese-romaji response mode toggle. Flips + persists via the
+        // main process, then mirrors the returned state onto the button's
+        // 'active' class (the single visible source of truth) and broadcasts
+        // so it can't silently drift from Settings or other windows.
+        if (this.japaneseModeButton) {
+            this.japaneseModeButton.addEventListener('click', async () => {
+                if (!this.isInteractive) return;
+                if (!window.electronAPI || !window.electronAPI.toggleJapaneseMode) return;
+                try {
+                    const enabled = await window.electronAPI.toggleJapaneseMode();
+                    this.japaneseModeButton.classList.toggle('active', !!enabled);
+                } catch (error) {
+                    logger.error('Failed to toggle Japanese mode', {
+                        component: 'MainWindowUI',
+                        error: error.message
+                    });
+                }
+            });
+        }
 
         // Check for required elements (settingsIndicator is optional)
         if (this.settingsIndicator) {
@@ -338,22 +324,26 @@ class MainWindowUI {
         // Language dropdown
         this.languageSelect = document.getElementById('codingLanguage');
         if (this.languageSelect) {
-            // Set default to C++ if no value is set
-            this.languageSelect.value = 'cpp';
-            
+            const validLanguages = Array.from(this.languageSelect.options).map(o => o.value);
+            const DEFAULT_LANGUAGE = 'kotlin';
+            // Set default to Kotlin if no value is set
+            this.languageSelect.value = DEFAULT_LANGUAGE;
+
             // Initialize with current setting
             if (window.electronAPI && window.electronAPI.getSettings) {
                 window.electronAPI.getSettings().then(settings => {
-                    if (settings && settings.codingLanguage) {
+                    // A stored value from before C/C++ were dropped (e.g. 'cpp')
+                    // is no longer a valid option — fall back to the default
+                    // instead of silently leaving the dropdown unselected.
+                    if (settings && settings.codingLanguage && validLanguages.includes(settings.codingLanguage)) {
                         this.languageSelect.value = settings.codingLanguage;
                     } else {
-                        // Save C++ as default if no language is set
-                        this.languageSelect.value = 'cpp';
-                        window.electronAPI.saveSettings({ codingLanguage: 'cpp' });
+                        this.languageSelect.value = DEFAULT_LANGUAGE;
+                        window.electronAPI.saveSettings({ codingLanguage: DEFAULT_LANGUAGE });
                     }
                 }).catch(() => {
-                    // Fallback to C++ on error
-                    this.languageSelect.value = 'cpp';
+                    // Fallback to Kotlin on error
+                    this.languageSelect.value = DEFAULT_LANGUAGE;
                 });
             }
 
@@ -433,12 +423,6 @@ class MainWindowUI {
                 this.handleRecordingStopped();
             });
 
-            window.electronAPI.onSkillChanged((event, data) => {
-                if (data && data.skill) {
-                    this.handleSkillChanged(data);
-                }
-            });
-
             window.electronAPI.onSpeechAvailability((event, data) => {
                 this.speechAvailable = !!(data && data.available);
                 this.applyMicVisibility();
@@ -455,6 +439,14 @@ class MainWindowUI {
                         component: 'MainWindowUI',
                         language: data.language
                     });
+                }
+            });
+
+            // Listen for Japanese-mode changes from other windows (e.g. the
+            // Settings dropdown) so the bar button can't drift out of sync.
+            window.electronAPI.onJapaneseModeChanged((event, data) => {
+                if (this.japaneseModeButton && data && typeof data.enabled === 'boolean') {
+                    this.japaneseModeButton.classList.toggle('active', data.enabled);
                 }
             });
 
@@ -488,23 +480,6 @@ class MainWindowUI {
                 this.handleInteractionModeChanged(interactive);
             });
             
-            window.api.receive('skill-updated', (data) => {
-                logger.info('Skill updated event received from main process:', data);
-                if (data && data.skill) {
-                    this.handleSkillChanged(data);
-                } else if (typeof data === 'string') {
-                    // Handle case where skill is passed directly as string
-                    this.handleSkillChanged({ skill: data });
-                } else {
-                    logger.warn('Skill updated event received but no skill data found:', data);
-                }
-            });
-            
-            // Listen for skill updates from settings window  
-            window.api.receive('update-skill', (skill) => {
-                logger.info('Direct skill update received from settings:', skill);
-                this.handleSkillChanged({ skill: skill });
-            });
         } else {
             logger.error('window.api not available - event listeners not set up!');
         }
@@ -520,11 +495,12 @@ class MainWindowUI {
         const skill = data.skill || data.metadata?.skill || 'General';
         const skillNames = {
             'dsa': 'DSA',
-            'behavioral': 'Behavioral', 
+            'programming': 'Programming',
+            'android': 'Android',
+            'behavioral': 'Behavioral',
             'sales': 'Sales',
             'presentation': 'Presentation',
             'data-science': 'Data Science',
-            'programming': 'Programming',
             'devops': 'DevOps',
             'system-design': 'System Design',
             'negotiation': 'Negotiation'
@@ -560,14 +536,7 @@ class MainWindowUI {
                 e.preventDefault();
 
                 if (this.isInteractive) {
-                    // Interactive mode: Cmd + Up/Down for skill navigation
-                    if (e.key === 'ArrowUp') {
-                        this.navigateSkill(-1); // Previous skill
-                    } else if (e.key === 'ArrowDown') {
-                        this.navigateSkill(1); // Next skill
-                    } else {
-                    }
-                    // Left/Right arrows do nothing in interactive mode
+                    // Interactive mode: Cmd + Arrow keys do nothing
                 } else {
                     // Non-interactive mode: Cmd + Arrow keys for window movement
                     this.moveWindow(e.key);
@@ -596,44 +565,11 @@ class MainWindowUI {
         if (!this.isInteractive && this.shortcutsPopover && this.shortcutsPopover.style.display !== 'none') {
             this.hideShortcutsPopover();
         }
-        
-        // Update skill indicator tooltip
-        this.updateSkillIndicator();
-        
+
         logger.info('Interaction mode change completed', {
             component: 'MainWindowUI',
             interactive: this.isInteractive,
-            statusDotClass: this.statusDot ? this.statusDot.className : 'not found',
-            skillIndicatorClass: this.skillIndicator ? this.skillIndicator.className : 'not found'
-        });
-    }
-
-    handleSkillChanged(data) {
-        const oldSkill = this.currentSkill;
-        this.currentSkill = data.skill;
-        
-        logger.info('Handling skill change', {
-            component: 'MainWindowUI',
-            oldSkill: oldSkill,
-            newSkill: data.skill,
-            skillIndicatorExists: !!this.skillIndicator
-        });
-        
-        this.updateSkillIndicator();
-        
-        logger.info('Skill changed successfully', {
-            component: 'MainWindowUI',
-            skill: data.skill
-        });
-    }
-
-    handleSkillActivated(skillName) {
-        this.currentSkill = skillName;
-        this.updateSkillIndicator();
-        
-        logger.info('Skill activated', {
-            component: 'MainWindowUI',
-            skill: skillName
+            statusDotClass: this.statusDot ? this.statusDot.className : 'not found'
         });
     }
 
@@ -754,173 +690,6 @@ class MainWindowUI {
                 error: error.message
             });
         }
-    }
-
-    updateSkillIndicator() {
-        const skillNames = {
-            'dsa': 'DSA',
-            'behavioral': 'Behavioral', 
-            'sales': 'Sales',
-            'presentation': 'Presentation',
-            'data-science': 'Data Science',
-            'programming': 'Programming',
-            'devops': 'DevOps',
-            'system-design': 'System Design',
-            'negotiation': 'Negotiation'
-        };
-        
-        logger.info('Updating skill indicator', {
-            component: 'MainWindowUI',
-            currentSkill: this.currentSkill,
-            skillIndicatorExists: !!this.skillIndicator
-        });
-        
-        if (!this.skillIndicator) {
-            logger.error('Skill indicator element not found!');
-            return;
-        }
-        
-        const skillName = skillNames[this.currentSkill] || this.currentSkill.toUpperCase();
-        const skillSpan = this.skillIndicator.querySelector('span');
-        
-        logger.info('Looking for skill span element', {
-            component: 'MainWindowUI',
-            spanExists: !!skillSpan,
-            skillName: skillName
-        });
-        
-        if (skillSpan) {
-            const oldText = skillSpan.textContent;
-            skillSpan.textContent = skillName;
-                        
-            const tooltip = this.isInteractive ? 
-                `${skillName} - Use ⌘↑/↓ to navigate skills` : 
-                `${skillName} - Enable interactive mode (Alt+A) to navigate`;
-            this.skillIndicator.title = tooltip;
-            
-            // Add visual feedback for skill change
-            this.animateSkillChange();
-            
-            logger.info('Skill indicator updated successfully', {
-                component: 'MainWindowUI',
-                oldText: oldText,
-                newText: skillName,
-                interactive: this.isInteractive
-            });
-        } else {
-            logger.error('Skill span element not found within skill indicator!');
-        }
-    }
-
-    animateSkillChange() {
-        if (this.skillIndicator) {
-            this.skillIndicator.style.transform = 'scale(1.1)';
-            this.skillIndicator.style.transition = 'transform 0.2s ease';
-            
-            setTimeout(() => {
-                this.skillIndicator.style.transform = 'scale(1)';
-            }, 200);
-        }
-    }
-
-    navigateSkill(direction) {
-        
-        if (!this.isInteractive) {
-            return;
-        }
-        
-        const currentIndex = this.availableSkills.indexOf(this.currentSkill);
-        if (currentIndex === -1) {
-            logger.error('Current skill not found in available skills array');
-            return;
-        }
-        
-        // Calculate new index with wrapping
-        let newIndex = currentIndex + direction;
-        if (newIndex >= this.availableSkills.length) {
-            newIndex = 0; // Wrap to beginning
-        } else if (newIndex < 0) {
-            newIndex = this.availableSkills.length - 1; // Wrap to end
-        }
-        
-        const newSkill = this.availableSkills[newIndex];
-        
-        // Update skill locally and notify main process
-        this.currentSkill = newSkill;
-        this.updateSkillIndicator();
-        
-        // Save the skill change via IPC
-        if (window.electronAPI && window.electronAPI.updateActiveSkill) {
-            window.electronAPI.updateActiveSkill(newSkill).then(() => {
-                logger.info('Skill navigation completed', {
-                    component: 'MainWindowUI',
-                    newSkill,
-                    direction: direction > 0 ? 'down' : 'up'
-                });
-            }).catch(error => {
-                logger.error('Failed to update skill via navigation', {
-                    component: 'MainWindowUI',
-                    error: error.message
-                });
-            });
-        }
-        
-        // Show visual feedback
-        this.showSkillChangeNotification(newSkill, direction);
-    }
-
-    showSkillChangeNotification(skill, direction) {
-        const skillNames = {
-            'dsa': 'DSA',
-            'behavioral': 'Behavioral', 
-            'sales': 'Sales',
-            'presentation': 'Presentation',
-            'data-science': 'Data Science',
-            'programming': 'Programming',
-            'devops': 'DevOps',
-            'system-design': 'System Design',
-            'negotiation': 'Negotiation'
-        };
-        
-        const displayName = skillNames[skill] || skill.toUpperCase();
-        const arrow = direction > 0 ? '↓' : '↑';
-        
-        // Create temporary notification
-        const notification = document.createElement('div');
-        notification.className = 'skill-change-notification';
-        notification.innerHTML = `${arrow} ${displayName}`;
-        notification.style.cssText = `
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: rgba(0, 0, 0, 0.8);
-            color: white;
-            padding: 8px 16px;
-            border-radius: 6px;
-            font-size: 14px;
-            font-weight: 600;
-            z-index: 1000;
-            opacity: 0;
-            transition: opacity 0.2s ease;
-        `;
-        
-        document.body.appendChild(notification);
-        
-        // Animate in
-        setTimeout(() => {
-            notification.style.opacity = '1';
-        }, 10);
-        
-        // Remove after 1 second
-        setTimeout(() => {
-            notification.style.opacity = '0';
-            setTimeout(() => {
-                if (notification.parentNode) {
-                    notification.parentNode.removeChild(notification);
-                }
-            }, 200);
-        }, 1000);
     }
 
     showHiddenIndicator() {

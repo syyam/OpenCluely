@@ -1,13 +1,15 @@
 const fs = require('fs');
 const path = require('path');
+const { getCandidateContextBlock, isPersonalContextRelevant } = require('./src/core/candidate-context');
+const { getInterviewMetadataBlock } = require('./src/core/interview-metadata');
+const { getJapaneseModeInstructionBlock, isJapaneseModeEnabled } = require('./src/core/response-language');
 
 class PromptLoader {
   constructor() {
     this.prompts = new Map();
     this.promptsLoaded = false;
     this.skillPromptSent = new Set();
-    // Focus only on DSA
-    this.skillsRequiringProgrammingLanguage = ['dsa'];
+    this.skillsRequiringProgrammingLanguage = ['android', 'frontend', 'fullstack'];
   }
 
   /**
@@ -28,7 +30,6 @@ class PromptLoader {
       for (const file of files) {
         if (file.endsWith('.md')) {
           const skillName = path.basename(file, '.md');
-          if (skillName !== 'dsa') continue; // only keep DSA
           const filePath = path.join(promptsDir, file);
           const promptContent = fs.readFileSync(filePath, 'utf8');
           
@@ -48,16 +49,19 @@ class PromptLoader {
    * Get the system prompt for a specific skill with optional programming language injection
    * @param {string} skillName - The name of the skill
    * @param {string|null} programmingLanguage - Optional programming language to inject
+   * @param {string|null} questionText - The actual question being asked, used only to decide
+   *   whether the resume/interview-metadata blocks are worth including (see
+   *   isPersonalContextRelevant) — not otherwise part of the prompt itself.
    * @returns {string|null} The system prompt content or null if not found
    */
-  getSkillPrompt(skillName, programmingLanguage = null) {
+  getSkillPrompt(skillName, programmingLanguage = null, questionText = null) {
     if (!this.promptsLoaded) {
       this.loadPrompts();
     }
 
     const normalizedSkillName = this.normalizeSkillName(skillName);
     let promptContent = this.prompts.get(normalizedSkillName);
-    
+
     if (!promptContent) {
       return null;
     }
@@ -66,6 +70,24 @@ class PromptLoader {
     if (programmingLanguage && this.skillsRequiringProgrammingLanguage.includes(normalizedSkillName)) {
       promptContent = this.injectProgrammingLanguage(promptContent, programmingLanguage, normalizedSkillName);
     }
+
+    // The resume + interview-metadata blocks are ~1,500-1,800 tokens —
+    // real weight to pay on every plain technical question. Only include
+    // them when they're actually likely to matter: a behavioral/personal-
+    // sounding question, or Japanese mode is on (the candidate can't
+    // self-translate their own resume facts into romaji, so needs them
+    // available for every question while practicing in Japanese).
+    if (isJapaneseModeEnabled() || isPersonalContextRelevant(questionText)) {
+      // normalizedSkillName doubles as the active resume-profile id
+      // (android/frontend/fullstack).
+      promptContent += getCandidateContextBlock(normalizedSkillName);
+      // Global, not per-profile: visa/relocation/self-intro notes apply
+      // regardless of active resume profile.
+      promptContent += getInterviewMetadataBlock();
+    }
+    // Unconditional on Japanese mode alone — a formatting rule, not
+    // personal content, so it's independent of the gate above.
+    promptContent += getJapaneseModeInstructionBlock();
 
     return promptContent;
   }
@@ -78,8 +100,8 @@ class PromptLoader {
    * @returns {string} Modified prompt with programming language context
    */
   injectProgrammingLanguage(promptContent, programmingLanguage, skillName) {
-    const languageMap = { cpp: 'C++', c: 'C', python: 'Python', java: 'Java', javascript: 'JavaScript', js: 'JavaScript' };
-    const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
+    const languageMap = { cpp: 'C++', c: 'C', kotlin: 'Kotlin', python: 'Python', java: 'Java', javascript: 'JavaScript', js: 'JavaScript' };
+    const fenceTagMap = { cpp: 'cpp', c: 'c', kotlin: 'kotlin', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
     const norm = (programmingLanguage || '').toLowerCase();
     const languageTitle = languageMap[norm] || (programmingLanguage.charAt(0).toUpperCase() + programmingLanguage.slice(1));
     const fenceTag = fenceTagMap[norm] || norm || 'text';
@@ -88,7 +110,9 @@ class PromptLoader {
     let languageInjection = '';
     
     switch (skillName) {
-      case 'dsa':
+      case 'android':
+      case 'frontend':
+      case 'fullstack':
         languageInjection = `\n\n## IMPLEMENTATION LANGUAGE: ${languageUpper}
 STRICT REQUIREMENTS:
 - Respond ONLY in ${languageTitle}. Do not include any snippets or alternatives in other languages.
@@ -150,7 +174,7 @@ STRICT REQUIREMENTS:
    */
   prepareGeminiRequest(skillName, userMessage, storedMemory, programmingLanguage = null) {
     const normalizedSkillName = this.normalizeSkillName(skillName);
-    const skillPrompt = this.getSkillPrompt(normalizedSkillName, programmingLanguage);
+    const skillPrompt = this.getSkillPrompt(normalizedSkillName, programmingLanguage, userMessage);
     
     const requestConfig = {
       model: 'gemini-pro', // or your preferred Gemini model
@@ -215,7 +239,7 @@ STRICT REQUIREMENTS:
   getRequestComponents(skillName, userMessage, storedMemory, programmingLanguage = null) {
     const normalizedSkillName = this.normalizeSkillName(skillName);
     const shouldUseModelMemory = this.shouldSendAsModelMemory(skillName, storedMemory);
-    const skillPrompt = this.getSkillPrompt(normalizedSkillName, programmingLanguage);
+    const skillPrompt = this.getSkillPrompt(normalizedSkillName, programmingLanguage, userMessage);
 
     return {
       skillName: normalizedSkillName,
@@ -368,7 +392,7 @@ STRICT REQUIREMENTS:
     if (!this.promptsLoaded) {
       this.loadPrompts();
     }
-    return ['dsa'];
+    return Array.from(this.prompts.keys());
   }
 
   /**

@@ -1,7 +1,10 @@
 const path = require("path");
 const fs = require("fs");
 const { fileURLToPath } = require("url");
-const { app, BrowserWindow, globalShortcut, session, ipcMain } = require("electron");
+const { app, BrowserWindow, globalShortcut, session, ipcMain, dialog } = require("electron");
+const candidateContext = require("./src/core/candidate-context");
+const interviewMetadata = require("./src/core/interview-metadata");
+const responseLanguage = require("./src/core/response-language");
 
 // ── Resolve a stable .env location ──
 // In packaged builds process.cwd() is unstable and frequently read-only
@@ -112,9 +115,14 @@ class ApplicationController {
   constructor() {
     this.isReady = false;
     this.starting = false;
-    this.activeSkill = "dsa";
-  // Default to C++ so language is enforced from first run
-  this.codingLanguage = "cpp";
+    // activeSkill doubles as the active resume-profile id (android/frontend/
+    // fullstack) — see src/core/candidate-context.js. Android is default.
+    this.activeSkill = candidateContext.DEFAULT_PROFILE;
+  // Default to Kotlin so language is enforced from first run
+  this.codingLanguage = "kotlin";
+  // Global romaji-only Japanese response mode — orthogonal to activeSkill,
+  // read from response-language.js's persisted flag on startup.
+  this.japaneseMode = responseLanguage.isJapaneseModeEnabled();
     this.speechAvailable = false;
 
     // Utterance coalescing: VAD emits a transcript per natural pause, but a
@@ -731,6 +739,52 @@ class ApplicationController {
       return this.getSettings();
     });
 
+    // Resume/background upload — opens a native file picker, extracts text
+    // (.txt/.md read directly, .pdf via pdf-parse), persists it, and hands
+    // the extracted text back so the settings UI can show it in the textarea.
+    ipcMain.handle("upload-resume-file", async () => {
+      try {
+        const settingsWindow = windowManager.getWindow("settings");
+        const result = await dialog.showOpenDialog(settingsWindow || undefined, {
+          title: "Select resume / background file",
+          properties: ["openFile"],
+          filters: [
+            { name: "Resume", extensions: ["pdf", "txt", "md"] },
+            { name: "All Files", extensions: ["*"] },
+          ],
+        });
+
+        if (result.canceled || !result.filePaths.length) {
+          return { success: false, canceled: true };
+        }
+
+        const text = await candidateContext.extractTextFromFile(result.filePaths[0]);
+        // Uploads go into whichever resume profile is currently active
+        // (this.activeSkill); the settings UI saves the profile dropdown
+        // immediately on change, so this is always in sync with what's shown.
+        candidateContext.writeCandidateContext(this.activeSkill, text);
+
+        return { success: true, text, fileName: path.basename(result.filePaths[0]) };
+      } catch (error) {
+        logger.warn("Resume upload failed", { error: error.message });
+        return { success: false, error: error.message };
+      }
+    });
+
+    // Japanese-romaji response mode toggle — bar button flips it (no
+    // desired-state argument, just "switch it"); the Settings dropdown sets
+    // an explicit value instead, via saveSettings() below. Both converge on
+    // the same response-language.js state and the same broadcast event so
+    // the two controls can never drift apart.
+    ipcMain.handle("toggle-japanese-mode", () => {
+      this.japaneseMode = !this.japaneseMode;
+      responseLanguage.setJapaneseModeEnabled(this.japaneseMode);
+      windowManager.broadcastToAllWindows("japanese-mode-changed", {
+        enabled: this.japaneseMode,
+      });
+      return this.japaneseMode;
+    });
+
     // First-run onboarding status — renderer can query to know whether
     // to show the welcome banner / prompt for API-key entry.
     ipcMain.handle("get-first-run-status", () => {
@@ -848,12 +902,6 @@ class ApplicationController {
       return this.updateAppIcon(iconKey);
     });
 
-    ipcMain.handle("update-active-skill", (event, skill) => {
-      this.activeSkill = skill;
-      windowManager.broadcastToAllWindows("skill-changed", { skill });
-      return { success: true };
-    });
-
     ipcMain.handle("restart-app-for-stealth", () => {
       // Force restart the app to ensure stealth name changes take effect
       const { app } = require("electron");
@@ -922,12 +970,6 @@ class ApplicationController {
       this.saveSettings(settings);
     });
 
-    // Handle update skill
-    ipcMain.on("update-skill", (event, skill) => {
-      this.activeSkill = skill;
-      windowManager.broadcastToAllWindows("skill-updated", { skill });
-    });
-
     // Handle quit app (alternative method)
     ipcMain.on("quit-app", () => {
       logger.info("Quit app requested via IPC (on method)");
@@ -986,25 +1028,21 @@ class ApplicationController {
   handleUpArrow() {
     const isInteractive = windowManager.getWindowStats().isInteractive;
 
-    if (isInteractive) {
-      // Interactive mode: Navigate to previous skill
-      this.navigateSkill(-1);
-    } else {
+    if (!isInteractive) {
       // Non-interactive mode: Move window up
       windowManager.moveBoundWindows(0, -20);
     }
+    // Interactive mode: Up arrow does nothing
   }
 
   handleDownArrow() {
     const isInteractive = windowManager.getWindowStats().isInteractive;
 
-    if (isInteractive) {
-      // Interactive mode: Navigate to next skill
-      this.navigateSkill(1);
-    } else {
+    if (!isInteractive) {
       // Non-interactive mode: Move window down
       windowManager.moveBoundWindows(0, 20);
     }
+    // Interactive mode: Down arrow does nothing
   }
 
   handleLeftArrow() {
@@ -1025,44 +1063,6 @@ class ApplicationController {
       windowManager.moveBoundWindows(20, 0);
     }
     // Interactive mode: Right arrow does nothing
-  }
-
-  navigateSkill(direction) {
-    const availableSkills = [
-      "dsa",
-    ];
-
-    const currentIndex = availableSkills.indexOf(this.activeSkill);
-    if (currentIndex === -1) {
-      logger.warn("Current skill not found in available skills", {
-        currentSkill: this.activeSkill,
-        availableSkills,
-      });
-      return;
-    }
-
-    // Calculate new index with wrapping
-    let newIndex = currentIndex + direction;
-    if (newIndex >= availableSkills.length) {
-      newIndex = 0; // Wrap to beginning
-    } else if (newIndex < 0) {
-      newIndex = availableSkills.length - 1; // Wrap to end
-    }
-
-    const newSkill = availableSkills[newIndex];
-    this.activeSkill = newSkill;
-
-    // Update session manager with the new skill
-    sessionManager.setActiveSkill(newSkill);
-
-    logger.info("Skill navigated via global shortcut", {
-      from: availableSkills[currentIndex],
-      to: newSkill,
-      direction: direction > 0 ? "down" : "up",
-    });
-
-    // Broadcast the skill change to all windows
-    windowManager.broadcastToAllWindows("skill-updated", { skill: newSkill });
   }
 
   async triggerScreenshotOCR() {
@@ -1087,7 +1087,7 @@ class ApplicationController {
       // Use image directly with LLM and active skill; do not send chat messages here
       const sessionHistory = sessionManager.getOptimizedHistory();
 
-      const skillsRequiringProgrammingLanguage = ['dsa'];
+      const skillsRequiringProgrammingLanguage = ['android', 'frontend', 'fullstack'];
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
       this._responseSeq = (this._responseSeq || 0) + 1;
@@ -1125,7 +1125,8 @@ class ApplicationController {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
-        isImageAnalysis: true
+        isImageAnalysis: true,
+        messageId: llmResult.metadata.messageId
       });
     } catch (error) {
       logger.error("Screenshot OCR process failed", {
@@ -1153,7 +1154,7 @@ class ApplicationController {
       sessionManager.addUserInput(text, 'llm_input');
 
       // Check if current skill needs programming language context
-      const skillsRequiringProgrammingLanguage = ['dsa'];
+      const skillsRequiringProgrammingLanguage = ['android', 'frontend', 'fullstack'];
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
       this._responseSeq = (this._responseSeq || 0) + 1;
@@ -1199,6 +1200,7 @@ class ApplicationController {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
+        messageId: llmResult.metadata.messageId,
       });
     } catch (error) {
       logger.error("LLM processing failed", {
@@ -1322,7 +1324,7 @@ class ApplicationController {
       });
 
       // Check if current skill needs programming language context
-      const skillsRequiringProgrammingLanguage = ['dsa'];
+      const skillsRequiringProgrammingLanguage = ['android', 'frontend', 'fullstack'];
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
       // Stream the answer progressively to the configured speech target.
@@ -1365,7 +1367,8 @@ class ApplicationController {
           skill: this.activeSkill,
           processingTime: llmResult.metadata.processingTime,
           usedFallback: llmResult.metadata.usedFallback,
-          isTranscriptionResponse: true
+          isTranscriptionResponse: true,
+          messageId: llmResult.metadata.messageId
         });
       }
 
@@ -1407,7 +1410,8 @@ class ApplicationController {
             skill: this.activeSkill,
             processingTime: fallbackResult.metadata.processingTime,
             usedFallback: true,
-            isTranscriptionResponse: true
+            isTranscriptionResponse: true,
+            messageId: fallbackResult.metadata.messageId
           });
         }
         logger.info("Used fallback response for transcription", {
@@ -1589,8 +1593,7 @@ class ApplicationController {
     // using. Empty strings are returned rather than skipped so the UI can
     // distinguish "unset" from "stale value from a previous load".
     return {
-      codingLanguage: this.codingLanguage || "cpp",
-      activeSkill: this.activeSkill || "dsa",
+      codingLanguage: this.codingLanguage || "kotlin",
       appIcon: this.appIcon || "terminal",
       selectedIcon: this.appIcon || "terminal",
       windowGap: windowManager.windowGap,
@@ -1607,6 +1610,13 @@ class ApplicationController {
       whisperResponseTarget: process.env.WHISPER_RESPONSE_TARGET || "both",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
       geminiKey: process.env.GEMINI_API_KEY || "",
+      geminiModel: process.env.GEMINI_MODEL || "gemini-3.1-flash-lite",
+
+      resumeProfile: this.activeSkill || candidateContext.DEFAULT_PROFILE,
+      resumeProfiles: candidateContext.getProfileList(),
+      resumeContext: candidateContext.readCandidateContext(this.activeSkill),
+      interviewMetadata: interviewMetadata.readInterviewMetadata(),
+      japaneseMode: !!this.japaneseMode,
 
       azureConfigured: !!process.env.AZURE_SPEECH_KEY && !!process.env.AZURE_SPEECH_REGION,
       speechAvailable: this.speechAvailable
@@ -1622,12 +1632,6 @@ class ApplicationController {
           language: settings.codingLanguage,
         });
       }
-      if (settings.activeSkill) {
-        this.activeSkill = settings.activeSkill;
-        windowManager.broadcastToAllWindows("skill-updated", {
-          skill: settings.activeSkill,
-        });
-      }
       if (settings.appIcon) {
         this.appIcon = settings.appIcon;
       }
@@ -1638,6 +1642,34 @@ class ApplicationController {
       if (settings.windowGap !== undefined) {
         const gap = Number(settings.windowGap);
         if (Number.isFinite(gap)) windowManager.setWindowGap(gap);
+      }
+      // Resume profile switch — doubles as activeSkill (see constructor
+      // comment), so this changes both which prompt depth (android/
+      // frontend/fullstack) and which saved resume get used. Handled before
+      // resumeContext below so a combined {resumeProfile, resumeContext}
+      // save (switching profile while editing) lands on the right file.
+      if (settings.resumeProfile && Object.prototype.hasOwnProperty.call(candidateContext.PROFILES, settings.resumeProfile)) {
+        this.activeSkill = settings.resumeProfile;
+      }
+      // Resume/background text — stored in its own file per profile, not
+      // .env (see candidate-context.js: .env values get newline-collapsed
+      // which would mangle multi-line resume text).
+      if (settings.resumeContext !== undefined) {
+        candidateContext.writeCandidateContext(this.activeSkill, settings.resumeContext);
+      }
+      // Personal/interview metadata — global, not per-profile (visa status
+      // etc. doesn't change with the active resume profile).
+      if (settings.interviewMetadata !== undefined) {
+        interviewMetadata.writeInterviewMetadata(settings.interviewMetadata);
+      }
+      // Japanese-mode explicit set (Settings dropdown) — same state +
+      // broadcast as the bar button's flip-toggle IPC handler above, so
+      // the two controls can never drift apart.
+      if (settings.japaneseMode !== undefined) {
+        const enabled = settings.japaneseMode === true || settings.japaneseMode === "on";
+        this.japaneseMode = enabled;
+        responseLanguage.setJapaneseModeEnabled(enabled);
+        windowManager.broadcastToAllWindows("japanese-mode-changed", { enabled });
       }
 
       // ── Persist provider / API-key fields back to .env ──
@@ -1678,6 +1710,9 @@ class ApplicationController {
       if (settings.geminiKey !== undefined) {
         envUpdates.GEMINI_API_KEY = settings.geminiKey;
       }
+      if (["gemini-3.1-flash-lite", "gemini-3.1-pro"].includes(settings.geminiModel)) {
+        envUpdates.GEMINI_MODEL = settings.geminiModel;
+      }
 
       // Capture the previous whisper command BEFORE persisting — persistEnvUpdates
       // mutates process.env in place, so comparing afterwards would always read
@@ -1698,6 +1733,23 @@ class ApplicationController {
           logger.info("LLM service reinitialized after Gemini key update");
         } catch (e) {
           logger.warn("Failed to reinitialize LLM service after Gemini key update", {
+            error: e.message
+          });
+        }
+      }
+
+      // Same re-init dance for model switches — config.js reads GEMINI_MODEL
+      // once at startup, so a runtime change has to be pushed into the
+      // in-memory config before the LLM service picks it up.
+      if (envUpdates.GEMINI_MODEL !== undefined) {
+        try {
+          config.set("llm.gemini.model", envUpdates.GEMINI_MODEL);
+          llmService.initializeClient();
+          logger.info("LLM service reinitialized after Gemini model change", {
+            model: envUpdates.GEMINI_MODEL
+          });
+        } catch (e) {
+          logger.warn("Failed to reinitialize LLM service after Gemini model change", {
             error: e.message
           });
         }

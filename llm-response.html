@@ -6,6 +6,13 @@
     <title>OpenCluely</title>
     <script src="lib/markdown.js"></script>
     <script src="lib/mathrender.js"></script>
+    <!-- PrismJS theme + line-numbers plugin theme for syntax-highlighted,
+         line-numbered code blocks (mirrors chat.html's working setup —
+         this window previously never loaded Prism at all, so code
+         rendered as unhighlighted plain text despite the surrounding
+         "editor" chrome). -->
+    <link rel="stylesheet" href="./node_modules/prismjs/themes/prism-tomorrow.min.css" />
+    <link rel="stylesheet" href="./node_modules/prismjs/plugins/line-numbers/prism-line-numbers.min.css" />
     <style>
         .text-white { color: white; }
         .text-gray-300 { color: #d1d5db; }
@@ -43,24 +50,24 @@
         .markdown-content p { margin-bottom: 0.8rem; color: white; font-size: 0.875rem; }
         .markdown-content ul, .markdown-content ol { margin-bottom: 0.8rem; padding-left: 1.2rem; font-size: 0.875rem; }
         .markdown-content li { margin-bottom: 0.4rem; color: white; font-size: 0.875rem; }
-        .markdown-content code { 
-            background-color: rgba(0, 0, 0, 0.4); 
-            padding: 0.2rem 0.4rem; 
-            border-radius: 0.25rem; 
+        .markdown-content code {
+            background-color: rgba(0, 0, 0, 0.4);
+            padding: 0.2rem 0.4rem;
+            border-radius: 0.25rem;
             font-family: 'Courier New', monospace;
             color: #e5e7eb;
         }
-        .markdown-content pre { 
-            background-color: rgba(0, 0, 0, 0.4); 
-            padding: 1rem; 
-            border-radius: 0.5rem; 
+        .markdown-content pre {
+            background-color: rgba(0, 0, 0, 0.4);
+            padding: 1rem;
+            border-radius: 0.5rem;
             margin: 1rem 0;
             overflow-x: auto;
             border: 1px solid rgba(255, 255, 255, 0.1);
         }
-        .markdown-content pre code { 
-            background-color: transparent; 
-            padding: 0; 
+        .markdown-content pre code {
+            background-color: transparent;
+            padding: 0;
             color: #e5e7eb;
         }
         .markdown-content blockquote {
@@ -88,74 +95,68 @@
             background: transparent;
         }
 
-        /* Split layout improvements */
-        .split-layout {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 0.75rem;
-            height: 100vh;
-            padding: 0;
-            box-sizing: border-box;
-            overflow: hidden;
-        }
-
-        /* Panel improvements with proper scrolling */
-        .text-panel, .code-panel {
-            background: transparent;
-            overflow: hidden;
-            position: relative;
-            min-height: 0; /* Important for grid items */
-        }
-
-        .panel-content {
+        /* Single shared-scroll response area. Every answer is one row in
+           #entries; alignment between an answer's explanation and its code
+           is structural (they're DOM siblings in the same grid row, see
+           .entry-body below), not JS-computed — this replaces the old
+           two-independent-columns + anchor-sync system entirely. */
+        .response-scroll {
             height: 100%;
             overflow-y: auto;
-            overflow-x: auto;
-            padding: 1rem;
+            overflow-x: hidden;
             box-sizing: border-box;
-            scroll-behavior: smooth;
         }
 
-        /* Full content layout */
-        .full-content {
-            height: 100vh;
-            padding: 0;
-            box-sizing: border-box;
-            overflow: hidden;
-            position: relative;
-        }
-
-        .full-content-inner {
-            height: 100%;
-            background-color: rgba(255, 255, 255, 0.05);
-            backdrop-filter: blur(10px);
-            border-radius: 0.5rem;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            overflow-y: auto;
-            overflow-x: auto;
+        .entries {
             padding: 1rem;
             box-sizing: border-box;
-            scroll-behavior: smooth;
         }
 
         /* Hide scrollbars completely while maintaining scrollability */
-        .panel-content::-webkit-scrollbar, 
-        .full-content-inner::-webkit-scrollbar {
+        .response-scroll::-webkit-scrollbar {
             width: 0px;
             height: 0px;
             display: none;
         }
-        
-        /* For Firefox and other browsers */
-        .panel-content, 
-        .full-content-inner {
+        .response-scroll {
             scrollbar-width: none;
             -ms-overflow-style: none;
         }
 
+        /* History entries — one per answer, appended not overwritten */
+        .response-entry { margin-bottom: 1.25rem; }
+        .response-entry:last-child { margin-bottom: 0; }
+        .entry-divider {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.7rem;
+            color: #9ca3af;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.5rem;
+            padding-bottom: 0.35rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        /* Explanation (left) + code (right), side by side, only when the
+           answer actually has code. A purely conversational/behavioral
+           answer gets .no-code instead — a single full-width column, no
+           separate "full layout" mode needed. */
+        .entry-body.has-code {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.75rem;
+            align-items: start;
+        }
+        .entry-body.no-code {
+            display: block;
+        }
+        .entry-text { min-width: 0; }
+        .entry-code { min-width: 0; }
+
         /* Code block styling */
         .code-block {
-            background-color: rgba(0, 0, 0, 0.3); 
+            background-color: rgba(0, 0, 0, 0.3);
             margin-bottom: 1rem;
             border-radius: 0.5rem;
             border: 1px solid rgba(255, 255, 255, 0.1);
@@ -185,40 +186,42 @@
             background-color: transparent;
             color: #e5e7eb;
         }
-        .no-code {
+
+        /* Loading state — a small corner badge, NOT a full-window takeover.
+           .main-container is position:relative, which this anchors to.
+           Previously this replaced #response-content entirely while a new
+           answer was being generated, hiding the whole accumulated history
+           behind an "Analyzing..." screen on every question. Now the
+           history stays visible/scrollable and this just floats over it. */
+        .loading {
+            position: absolute;
+            bottom: 16px;
+            right: 16px;
+            z-index: 50;
             display: flex;
             align-items: center;
             justify-content: center;
-            height: 100%;
-            color: #9ca3af;
-            font-style: italic;
+            background-color: rgba(20, 20, 20, 0.85);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 999px;
+            backdrop-filter: blur(8px);
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
         }
 
-        /* Loading state */
-        .loading {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-            background-color: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(8px);
-        }
-        
         .loading-compact {
             display: flex;
             align-items: center;
             justify-content: center;
-            width: 200px;
-            height: 60px;
+            padding: 10px 16px;
             background: transparent;
         }
-        
+
         .dots-container {
             display: inline-flex;
             align-items: center;
             gap: 0.3rem;
         }
-        
+
         .bouncing-dot {
             width: 8px;
             height: 8px;
@@ -226,11 +229,11 @@
             background-color: #4CAF50;
             animation: bounce 1.4s infinite ease-in-out;
         }
-        
+
         .bouncing-dot:nth-child(1) { animation-delay: -0.32s; }
         .bouncing-dot:nth-child(2) { animation-delay: -0.16s; }
         .bouncing-dot:nth-child(3) { animation-delay: 0s; }
-        
+
         @keyframes bounce {
             0%, 80%, 100% {
                 transform: scale(0);
@@ -242,14 +245,33 @@
             }
         }
 
+        /* Small, non-intrusive "new content" affordance — shown instead of
+           forcibly scrolling the user when they've scrolled up to review
+           older answers. Bottom-CENTER, distinct corner from .loading
+           (bottom-right) so both can be visible without overlapping. */
+        .new-response-indicator {
+            position: absolute;
+            bottom: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 40;
+            padding: 6px 14px;
+            background-color: rgba(76, 175, 80, 0.9);
+            color: white;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            cursor: pointer;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+            -webkit-app-region: no-drag;
+        }
+
         /* Interactive scrolling enhancements */
-        .interactive-scrolling .panel-content,
-        .interactive-scrolling .full-content-inner {
+        .interactive-scrolling .response-scroll {
             cursor: grab;
         }
 
-        .interactive-scrolling .panel-content:active,
-        .interactive-scrolling .full-content-inner:active {
+        .interactive-scrolling .response-scroll:active {
             cursor: grabbing;
         }
 
@@ -262,11 +284,11 @@
         .token.cdata {
             color: #6a737d;
         }
-        
+
         .token.punctuation {
             color: #e1e4e8;
         }
-        
+
         .token.property,
         .token.tag,
         .token.boolean,
@@ -276,7 +298,7 @@
         .token.deleted {
             color: #79b8ff;
         }
-        
+
         .token.selector,
         .token.attr-name,
         .token.string,
@@ -285,7 +307,7 @@
         .token.inserted {
             color: #85e89d;
         }
-        
+
         .token.operator,
         .token.entity,
         .token.url,
@@ -293,33 +315,33 @@
         .style .token.string {
             color: #f97583;
         }
-        
+
         .token.atrule,
         .token.attr-value,
         .token.keyword {
             color: #f97583;
         }
-        
+
         .token.function,
         .token.class-name {
             color: #b392f0;
         }
-        
+
         .token.regex,
         .token.important,
         .token.variable {
             color: #ffab70;
         }
-        
+
         .token.important,
         .token.bold {
             font-weight: bold;
         }
-        
+
         .token.italic {
             font-style: italic;
         }
-        
+
         .token.entity {
             cursor: help;
         }
@@ -383,36 +405,36 @@
             border-color: rgba(239, 68, 68, 0.45);
             color: #fff;
         }
-        
-        /* Push content below header */
-        .has-header #response-content,
-        .has-header #loading {
+
+        /* Push content below header. #loading/.new-response-indicator are
+           excluded — they're absolutely-positioned corner badges (relative
+           to .main-container), not part of the normal-flow layout these
+           push rules are for. */
+        .has-header #response-content {
             margin-top: 32px;
         }
-        .has-header .split-layout,
-        .has-header .full-content,
-        .has-header .loading {
+        .has-header .response-scroll {
             height: calc(100vh - 32px);
         }
 
-        .copy-btn { 
-            position: absolute; 
-            top: 6px; 
-            right: 6px; 
-            background: rgba(0,0,0,0.5); 
-            color: rgba(255,255,255,0.9); 
-            border: 1px solid rgba(255,255,255,0.2); 
-            padding: 4px 8px; 
-            font-size: 11px; 
-            border-radius: 4px; 
-            cursor: pointer; 
-            -webkit-app-region: no-drag; 
+        .copy-btn {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            background: rgba(0,0,0,0.5);
+            color: rgba(255,255,255,0.9);
+            border: 1px solid rgba(255,255,255,0.2);
+            padding: 4px 8px;
+            font-size: 11px;
+            border-radius: 4px;
+            cursor: pointer;
+            -webkit-app-region: no-drag;
             transition: background 0.2s ease, border-color 0.2s ease, transform 0.12s ease;
         }
         .copy-btn:hover { background: rgba(0,0,0,0.7); }
-        .copy-btn.copied { 
-            background: rgba(76,175,80,0.85); 
-            border-color: rgba(76,175,80,0.95); 
+        .copy-btn.copied {
+            background: rgba(76,175,80,0.85);
+            border-color: rgba(76,175,80,0.95);
             transform: scale(0.98);
         }
     </style>
@@ -439,66 +461,65 @@
             </div>
         </div>
 
-        <!-- Response Content -->
+        <!-- "New response" affordance — shown instead of force-scrolling
+             when the user has scrolled up to review older answers. -->
+        <div id="new-response-indicator" class="new-response-indicator hidden">New response ↓</div>
+
+        <!-- Response Content: one shared-scroll list of response entries -->
         <div id="response-content" class="content-area hidden">
-            <!-- Split Layout -->
-            <div id="split-layout" class="split-layout hidden">
-                <!-- Text Panel -->
-                <div class="text-panel">
-                    <div class="panel-content" tabindex="0">
-                        <div id="text-content" class="markdown-content"></div>
-                    </div>
-                </div>
-
-                <!-- Code Panel -->
-                <div class="code-panel">
-                    <div class="panel-content" tabindex="0">
-                        <div id="code-content"></div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Full Content (when no code detected) -->
-            <div id="full-content" class="full-content hidden">
-                <div class="full-content-inner" tabindex="0">
-                    <div id="full-markdown" class="markdown-content"></div>
-                </div>
+            <div id="response-scroll" class="response-scroll">
+                <div id="entries" class="entries"></div>
             </div>
         </div>
     </div>
 
     <script>
         // Global variables
-        let currentLayout = 'split';
         let hasCode = false;
-        let currentSkill = 'dsa';
+        let currentSkill = 'generic';
+        // History/scroll state — new answers are appended, not overwritten.
+        let responseIndex = 0;
+        let isFirstResponseEver = true;
         let isInteractive = false;
-        let scrollableElements = [];
+        let responseScrollEl = null;
         let initialized = false;
-        
+
+        // A response currently streaming in via transcription-llm-response
+        // -start/-chunk events. One variable (not a messageId-keyed map) is
+        // enough — this app never has more than one in-flight request per
+        // window (the fallback path on failure deliberately reuses the same
+        // messageId rather than starting a second stream).
+        let liveEntry = null;
+
+        // How close to the bottom (px) counts as "already following along" —
+        // within this, new content auto-scrolls into view; beyond it, the
+        // user is treated as deliberately reviewing older content and their
+        // position is left alone (see appendEntryNode/replaceEntryNode).
+        const NEAR_BOTTOM_PX = 80;
+
         // Immediate logging to verify script execution
         console.log('[LLM-RESPONSE] Script tag executed');
-        
+
         window.onerror = function(msg, url, line, col, error) {
             console.error('[LLM-RESPONSE] Window error:', msg, 'at line', line);
             return false;
         };
-        
+
         document.addEventListener('DOMContentLoaded', function() {
             console.log('[LLM-RESPONSE] DOMContentLoaded fired');
             initLLMResponseWindow();
         });
-        
+
         // Also try immediate init in case DOMContentLoaded already fired
         if (document.readyState === 'complete' || document.readyState === 'interactive') {
             console.log('[LLM-RESPONSE] Document already ready, initializing now');
             setTimeout(initLLMResponseWindow, 0);
         }
-        
+
         function initLLMResponseWindow() {
             if (initialized) return;
             initialized = true;
-            
+
             console.log('[LLM-RESPONSE] Initializing window...');
 
             // Prefer marked when available, but fall back to the bundled markdown.js parser.
@@ -522,22 +543,48 @@
 
             console.log('[LLM-RESPONSE] electronAPI exists:', !!window.electronAPI);
             console.log('[LLM-RESPONSE] onDisplayLlmResponse method:', typeof window.electronAPI?.onDisplayLlmResponse);
-            
+
             // Set up event listeners using electronAPI from preload script
             if (window.electronAPI) {
                 console.log('[LLM-RESPONSE] Setting up IPC listeners...');
-                
+
                 // Set up show-loading event listener
                 window.electronAPI.onShowLoading(() => {
                     console.log('[LLM-RESPONSE] show-loading received');
                     showLoadingState();
                 });
-                
+
+                // Streaming: a live entry appears the moment generation
+                // starts, grows as deltas arrive, and gets swapped for the
+                // fully-parsed final version once display-llm-response
+                // lands (see onDisplayLlmResponse below). Both are optional
+                // — if the preload bridge doesn't expose them for some
+                // reason, the window still works exactly as before (one
+                // complete render per answer via onDisplayLlmResponse).
+                if (typeof window.electronAPI.onTranscriptionLlmResponseStart === 'function') {
+                    window.electronAPI.onTranscriptionLlmResponseStart((event, data) => {
+                        try {
+                            handleStreamStart(data && typeof data === 'object' ? data : {});
+                        } catch (err) {
+                            console.error('[LLM-RESPONSE] Error handling stream start:', err);
+                        }
+                    });
+                }
+                if (typeof window.electronAPI.onTranscriptionLlmResponseChunk === 'function') {
+                    window.electronAPI.onTranscriptionLlmResponseChunk((event, data) => {
+                        try {
+                            handleStreamChunk(data && typeof data === 'object' ? data : {});
+                        } catch (err) {
+                            console.error('[LLM-RESPONSE] Error handling stream chunk:', err);
+                        }
+                    });
+                }
+
                 // Listen for LLM response
                 window.electronAPI.onDisplayLlmResponse(function() {
                     console.log('[LLM-RESPONSE] ===== display-llm-response received! =====');
                     console.log('[LLM-RESPONSE] arguments count:', arguments.length);
-                    
+
                     try {
                         // Get the data - could be first or second argument
                         let actualData = null;
@@ -546,18 +593,18 @@
                         } else if (arguments.length >= 1 && arguments[0] && typeof arguments[0] === 'object') {
                             actualData = arguments[0];
                         }
-                        
+
                         console.log('[LLM-RESPONSE] actualData keys:', actualData ? Object.keys(actualData) : 'null');
-                        
+
                         const response = actualData?.content || actualData?.response;
                         console.log('[LLM-RESPONSE] response found:', !!response, 'length:', response?.length);
-                        
+
                         if (!response) {
                             console.error('[LLM-RESPONSE] No response content found!');
                             hideLoadingState();
                             return;
                         }
-                        
+
                         hideLoadingState();
                         displayResponse(actualData);
                         setupScrolling();
@@ -568,7 +615,7 @@
                         hideLoadingState();
                     }
                 });
-                
+
                 console.log('[LLM-RESPONSE] IPC listeners set up successfully');
             } else {
                 console.error('[LLM-RESPONSE] electronAPI not available!');
@@ -577,17 +624,18 @@
 
         function showLoadingState() {
             const loadingElement = document.getElementById('loading');
-            const responseElement = document.getElementById('response-content');
-            
+
             if (loadingElement) {
                 loadingElement.classList.remove('hidden');
                 loadingElement.style.display = ''; // Remove any forced display styles
             }
-            
-            if (responseElement) {
-                responseElement.classList.add('hidden');
-            }
-            
+
+            // Deliberately NOT hiding #response-content here anymore — it
+            // used to be replaced by this "Analyzing..." state on every new
+            // question, hiding the whole accumulated answer history each
+            // time. The loading indicator is now a small corner badge (see
+            // .loading CSS) that floats over the still-visible, still-
+            // scrollable history instead of replacing it.
             console.log('Loading state shown - should see Analyzing...');
         }
 
@@ -614,43 +662,202 @@
             return escapeHtml(text).replace(/\n/g, '<br>');
         }
 
-        function calculateContentMetrics(response, codeBlocks) {
-            // Count lines in the response
-            const lineCount = response.split('\n').length;
-            
-            // Check for long lines (over 80 characters)
-            const hasLongLines = response.split('\n').some(line => line.length > 80);
-            
-            // Count code blocks
-            const codeBlockCount = codeBlocks.length;
-            
-            // Estimate content complexity
-            const hasCode = codeBlockCount > 0;
-            const isLongContent = lineCount > 30;
-            const hasMultipleCodeBlocks = codeBlockCount > 2;
-            
-            return {
-                lineCount,
-                hasLongLines,
-                codeBlocks: codeBlockCount,
-                hasCode,
-                isLongContent,
-                hasMultipleCodeBlocks,
-                complexity: isLongContent || hasMultipleCodeBlocks ? 'high' : hasCode ? 'medium' : 'low'
-            };
+        function getResponseScrollEl() {
+            return document.getElementById('response-scroll');
+        }
+
+        function isNearBottom(el) {
+            if (!el) return true;
+            return el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR_BOTTOM_PX;
+        }
+
+        function scrollToBottomInstant(el) {
+            // Instant, not smooth — this container also receives streamed
+            // mutations in quick succession; an animated scroll would still
+            // be mid-flight when the next chunk/entry arrives.
+            if (el) el.scrollTop = el.scrollHeight;
+        }
+
+        function showNewResponseIndicator() {
+            const el = document.getElementById('new-response-indicator');
+            if (el) el.classList.remove('hidden');
+        }
+
+        function hideNewResponseIndicator() {
+            const el = document.getElementById('new-response-indicator');
+            if (el) el.classList.add('hidden');
+        }
+
+        // Append a fully-built entry node, auto-scrolling only if the user
+        // was already at (or near) the bottom — otherwise their position is
+        // left alone and a "new response" pill appears instead.
+        function appendEntryNode(node) {
+            const scrollEl = getResponseScrollEl();
+            const stick = isFirstResponseEver || isNearBottom(scrollEl);
+            document.getElementById('entries').appendChild(node);
+            isFirstResponseEver = false;
+            if (stick) {
+                scrollToBottomInstant(scrollEl);
+                hideNewResponseIndicator();
+            } else {
+                showNewResponseIndicator();
+            }
+        }
+
+        // Swap a live (streaming) entry's row for its fully-parsed final
+        // version in place, instead of appending a duplicate.
+        function replaceEntryNode(oldNode, newNode) {
+            const scrollEl = getResponseScrollEl();
+            const stick = isNearBottom(scrollEl);
+            oldNode.replaceWith(newNode);
+            if (stick) {
+                scrollToBottomInstant(scrollEl);
+                hideNewResponseIndicator();
+            } else {
+                showNewResponseIndicator();
+            }
+        }
+
+        // A live streamed entry — created on transcription-llm-response-start,
+        // grown on each -chunk. Deliberately plain text (no markdown/Prism
+        // parse per chunk — too expensive to redo on every delta); it gets
+        // replaced wholesale by the fully-parsed version once the final
+        // display-llm-response event lands (see displayResponse).
+        function createLiveEntry(messageId, index) {
+            const entry = document.createElement('div');
+            entry.className = 'response-entry';
+            entry.dataset.responseIndex = String(index);
+
+            const divider = document.createElement('div');
+            divider.className = 'entry-divider';
+            divider.innerHTML = `<span>#${index}</span><span>${new Date().toLocaleTimeString()}</span>`;
+            entry.appendChild(divider);
+
+            const body = document.createElement('div');
+            body.className = 'entry-body no-code';
+            entry.appendChild(body);
+
+            const textEl = document.createElement('div');
+            textEl.className = 'markdown-content entry-text';
+            body.appendChild(textEl);
+
+            return { rowEl: entry, textBodyEl: textEl, messageId, index };
+        }
+
+        function handleStreamStart(data) {
+            if (!data || !data.messageId) return;
+
+            // Content is now visibly appearing — the "Analyzing..." badge
+            // would otherwise sit redundantly over live-streaming text.
+            hideLoadingState();
+
+            const responseElement = document.getElementById('response-content');
+            if (responseElement) responseElement.classList.remove('hidden');
+
+            responseIndex += 1;
+            const live = createLiveEntry(data.messageId, responseIndex);
+            liveEntry = live;
+            appendEntryNode(live.rowEl);
+        }
+
+        function handleStreamChunk(data) {
+            if (!liveEntry || !data || !data.messageId || data.messageId !== liveEntry.messageId) return;
+            if (!data.delta) return;
+
+            const scrollEl = getResponseScrollEl();
+            const stick = isNearBottom(scrollEl);
+            liveEntry.textBodyEl.textContent += data.delta;
+            if (stick) {
+                scrollToBottomInstant(scrollEl);
+                hideNewResponseIndicator();
+            } else {
+                showNewResponseIndicator();
+            }
+        }
+
+        // Builds one complete, fully-parsed `.response-entry` row (text +,
+        // when present, a code column) for a finished answer. Pure — does
+        // not touch the DOM outside the node it returns.
+        function buildEntryNode(response, index) {
+            const codeBlocks = extractCodeBlocks(response);
+            const hasCodeLocal = codeBlocks.length > 0;
+            hasCode = hasCodeLocal;
+
+            let textContent = response;
+            codeBlocks.forEach(block => {
+                textContent = textContent.replace(block.fullMatch, '');
+            });
+            textContent = textContent.replace(/\n\s*\n\s*\n/g, '\n\n').trim();
+            const textHtml = renderMarkdown(textContent);
+
+            const entry = document.createElement('div');
+            entry.className = 'response-entry';
+            entry.dataset.responseIndex = String(index);
+
+            const divider = document.createElement('div');
+            divider.className = 'entry-divider';
+            divider.innerHTML = `<span>#${index}</span><span>${new Date().toLocaleTimeString()}</span>`;
+            entry.appendChild(divider);
+
+            const body = document.createElement('div');
+            body.className = hasCodeLocal ? 'entry-body has-code' : 'entry-body no-code';
+            entry.appendChild(body);
+
+            const textEl = document.createElement('div');
+            textEl.className = 'markdown-content entry-text';
+            textEl.innerHTML = textHtml;
+            body.appendChild(textEl);
+            if (window.renderMathInElement) window.renderMathInElement(textEl);
+
+            if (hasCodeLocal) {
+                const codeEl = document.createElement('div');
+                codeEl.className = 'entry-code';
+
+                codeBlocks.forEach(block => {
+                    const codeBlock = document.createElement('div');
+                    codeBlock.className = 'code-block';
+                    codeBlock.innerHTML = `
+                        <div class="code-header">${block.language.toUpperCase()}</div>
+                        <div class="code-content">
+                            <pre class="line-numbers"><code class="language-${block.language}">${escapeHtml(block.code)}</code></pre>
+                        </div>
+                    `;
+                    const pre = codeBlock.querySelector('pre');
+                    pre.style.position = 'relative';
+                    const btn = document.createElement('button');
+                    btn.className = 'copy-btn';
+                    btn.textContent = 'Copy';
+                    attachCopy(btn, block.code || '');
+                    pre.appendChild(btn);
+
+                    codeEl.appendChild(codeBlock);
+                });
+
+                body.appendChild(codeEl);
+
+                if (typeof Prism !== 'undefined') {
+                    if (typeof Prism.highlightAllUnder === 'function') {
+                        Prism.highlightAllUnder(codeEl);
+                    } else {
+                        Prism.highlightAll();
+                    }
+                }
+            }
+
+            return entry;
         }
 
         function displayResponse(data) {
             // Show content
             const responseElement = document.getElementById('response-content');
-            
+
             if (responseElement) {
                 responseElement.classList.remove('hidden');
             }
 
             // Parse the response - check both content and response properties for compatibility
             const response = data.content || data.response;
-            
+
             if (!response) {
                 console.error('No response data received', {
                     dataKeys: Object.keys(data),
@@ -659,52 +866,35 @@
                 });
                 return;
             }
-            
-            // Check if response contains code blocks
-            const codeBlocks = extractCodeBlocks(response);
-            hasCode = codeBlocks.length > 0;
 
-            // Calculate content metrics for dynamic sizing
-            const contentMetrics = calculateContentMetrics(response, codeBlocks);
+            const incomingMessageId = data.metadata && data.metadata.messageId;
 
-            if (hasCode) {
-                // Split layout: text on left, code on right
-                displaySplitLayout(response, codeBlocks);
-            } else {
-                // Full layout: all content in one panel
-                displayFullLayout(response);
+            // If this is the final payload for the entry currently streaming
+            // in, replace that live row in place with the fully-parsed
+            // version instead of appending a duplicate.
+            if (liveEntry && incomingMessageId && incomingMessageId === liveEntry.messageId) {
+                const finalNode = buildEntryNode(response, liveEntry.index);
+                replaceEntryNode(liveEntry.rowEl, finalNode);
+                liveEntry = null;
+                return;
             }
-            
-            // Request dynamic window sizing based on content
-            setTimeout(() => {
-                window.electronAPI.resizeLlmWindowForContent(contentMetrics)
-                    .then(result => {
-                    })
-                    .catch(error => {
-                        console.error('Failed to resize window:', error);
-                    });
-            }, 200);
+
+            // No matching live entry (non-streamed path, or messageId
+            // missing/mismatched) — append fresh, same as before streaming
+            // existed. Safe fallback so nothing regresses if some call site
+            // doesn't carry a messageId.
+            liveEntry = null;
+            responseIndex += 1;
+            const node = buildEntryNode(response, responseIndex);
+            appendEntryNode(node);
         }
 
         function setupScrolling() {
-            // Set up scrollable elements based on current layout
             setTimeout(() => {
-                if (hasCode) {
-                    scrollableElements = [
-                        document.querySelector('.text-panel .panel-content'),
-                        document.querySelector('.code-panel .panel-content')
-                    ].filter(el => el !== null);
-                } else {
-                    scrollableElements = [
-                        document.querySelector('.full-content-inner')
-                    ].filter(el => el !== null);
+                responseScrollEl = getResponseScrollEl();
+                if (responseScrollEl) {
+                    responseScrollEl.setAttribute('tabindex', '0');
                 }
-                // Reset scroll positions and ensure elements are focusable
-                scrollableElements.forEach(element => {
-                    element.scrollTop = 0;
-                    element.scrollLeft = 0;
-                    element.setAttribute('tabindex', '0');
-                });
 
                 // Enable scrolling if interactive mode is on
                 if (isInteractive) {
@@ -714,30 +904,23 @@
         }
 
         function enableScrolling() {
-            scrollableElements.forEach(element => {
-                if (element) {
-                    // Enable mouse/trackpad scrolling with smooth behavior
-                    element.style.scrollBehavior = 'smooth';
-                    
-                    // Add mouse enter handler to ensure focus for scrolling
-                    element.addEventListener('mouseenter', handleMouseEnter, { passive: true });
-                    element.addEventListener('mouseleave', handleMouseLeave, { passive: true });
-                    
-                    // Add wheel event for enhanced scrolling
-                    element.addEventListener('wheel', handleWheelScroll, { passive: false });
-                    
-                }
-            });
+            const el = getResponseScrollEl();
+            if (!el) return;
+            // Deliberately NOT setting scrollBehavior = 'smooth' here —
+            // native wheel/trackpad scrolling already feels smooth on its
+            // own, and this container also receives instant programmatic
+            // writes (see scrollToBottomInstant) that must not animate.
+            el.addEventListener('mouseenter', handleMouseEnter, { passive: true });
+            el.addEventListener('mouseleave', handleMouseLeave, { passive: true });
+            el.addEventListener('wheel', handleWheelScroll, { passive: false });
         }
 
         function disableScrolling() {
-            scrollableElements.forEach(element => {
-                if (element) {
-                    element.removeEventListener('mouseenter', handleMouseEnter);
-                    element.removeEventListener('mouseleave', handleMouseLeave);
-                    element.removeEventListener('wheel', handleWheelScroll);
-                }
-            });
+            const el = getResponseScrollEl();
+            if (!el) return;
+            el.removeEventListener('mouseenter', handleMouseEnter);
+            el.removeEventListener('mouseleave', handleMouseLeave);
+            el.removeEventListener('wheel', handleWheelScroll);
         }
 
         function handleMouseEnter(e) {
@@ -801,107 +984,6 @@
             })
         }
 
-        function renderCopyButtonsInFullMarkdown(container) {
-            // Add copy buttons to all code blocks in full markdown view
-            const pres = container.querySelectorAll('pre');
-            pres.forEach(pre => {
-                // Avoid duplicate buttons
-                if (pre.querySelector('.copy-btn')) return;
-                const code = pre.querySelector('code');
-                const text = code ? code.textContent : pre.textContent;
-                const btn = document.createElement('button');
-                btn.className = 'copy-btn';
-                btn.textContent = 'Copy';
-                attachCopy(btn, text || '');
-                pre.style.position = 'relative';
-                pre.appendChild(btn);
-            });
-        }
-
-        function displaySplitLayout(response, codeBlocks) {
-            // Show split layout, hide full layout
-            document.getElementById('split-layout').classList.remove('hidden');
-            document.getElementById('full-content').classList.add('hidden');
-
-            // Remove code blocks from text content
-            let textContent = response;
-            codeBlocks.forEach(block => {
-                textContent = textContent.replace(block.fullMatch, '');
-            });
-
-            // Clean up text content
-            textContent = textContent.replace(/\n\s*\n\s*\n/g, '\n\n').trim();
-
-            // Render text content
-            const textHtml = renderMarkdown(textContent);
-            document.getElementById('text-content').innerHTML = textHtml;
-            if (window.renderMathInElement) window.renderMathInElement(document.getElementById('text-content'));
-
-            // Render code blocks
-            const codeContainer = document.getElementById('code-content');
-            codeContainer.innerHTML = '';
-
-            if (codeBlocks.length === 0) {
-                codeContainer.innerHTML = '<div class="no-code">No code examples found</div>';
-            } else {
-                codeBlocks.forEach((block, index) => {
-                    const codeBlock = document.createElement('div');
-                    codeBlock.className = 'code-block';
-                    codeBlock.innerHTML = `
-                        <div class="code-header">${block.language.toUpperCase()}</div>
-                        <div class="code-content">
-                            <pre><code class="language-${block.language}">${escapeHtml(block.code)}</code></pre>
-                        </div>
-                    `;
-                    const pre = codeBlock.querySelector('pre');
-                    pre.style.position = 'relative';
-                    const btn = document.createElement('button');
-                    btn.className = 'copy-btn';
-                    btn.textContent = 'Copy';
-                    attachCopy(btn, block.code || '');
-                    pre.appendChild(btn);
-
-                    codeContainer.appendChild(codeBlock);
-                });
-            }
-
-            // Highlight code if Prism is available
-            if (typeof Prism !== 'undefined') {
-                Prism.highlightAll();
-            }
-        }
-
-        function displayFullLayout(response) {
-            // Show full layout, hide split layout
-            document.getElementById('split-layout').classList.add('hidden');
-            document.getElementById('full-content').classList.remove('hidden');
-
-            // Render full markdown
-            const html = renderMarkdown(response);
-            const full = document.getElementById('full-markdown');
-            full.innerHTML = html;
-            if (window.renderMathInElement) window.renderMathInElement(full);
-
-            // Highlight any code if Prism is available
-            if (typeof Prism !== 'undefined') {
-                Prism.highlightAll();
-            }
-
-            // Add copy buttons to code blocks in full view
-            const pres = full.querySelectorAll('pre');
-            pres.forEach(pre => {
-                if (pre.querySelector('.copy-btn')) return;
-                const code = pre.querySelector('code');
-                const text = code ? code.textContent : pre.textContent;
-                const btn = document.createElement('button');
-                btn.className = 'copy-btn';
-                btn.textContent = 'Copy';
-                attachCopy(btn, text || '');
-                pre.style.position = 'relative';
-                pre.appendChild(btn);
-            });
-        }
-
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text;
@@ -919,30 +1001,25 @@
             console.log('LLM Response window closing');
         });
 
+        // New-response indicator: click to jump to the latest content.
+        (function() {
+            const el = document.getElementById('new-response-indicator');
+            if (!el) return;
+            el.addEventListener('click', () => {
+                scrollToBottomInstant(getResponseScrollEl());
+                hideNewResponseIndicator();
+            });
+        })();
+
         // Add keyboard scrolling support for when interactive
         document.addEventListener('keydown', (e) => {
             if (!isInteractive) return;
-            
-            const activeElement = document.activeElement;
-            let targetElement = null;
-            
-            // Find the currently focused scrollable element
-            for (let element of scrollableElements) {
-                if (element === activeElement || element.contains(activeElement)) {
-                    targetElement = element;
-                    break;
-                }
-            }
-            
-            // Default to first scrollable element if none focused
-            if (!targetElement && scrollableElements.length > 0) {
-                targetElement = scrollableElements[0];
-            }
-            
+
+            const targetElement = getResponseScrollEl();
             if (!targetElement) return;
-            
+
             const scrollAmount = 50; // Pixels to scroll
-            
+
             switch(e.key) {
                 case 'ArrowUp':
                     e.preventDefault();
@@ -983,16 +1060,16 @@
         function verifyDisplayState() {
             const loadingElement = document.getElementById('loading');
             const responseElement = document.getElementById('response-content');
-            
+
             const isLoadingHidden = loadingElement ? loadingElement.classList.contains('hidden') : true;
             const isContentVisible = responseElement ? !responseElement.classList.contains('hidden') : false;
-            
+
             console.log('Display state verification:', {
                 loadingHidden: isLoadingHidden,
                 contentVisible: isContentVisible,
                 windowVisible: !document.hidden
             });
-            
+
             if (!isLoadingHidden || !isContentVisible) {
                 console.warn('Display state inconsistent - forcing correction');
                 if (loadingElement) {
@@ -1008,11 +1085,10 @@
         // Add global debugging function
         window.debugLLMWindow = function() {
             console.log('=== LLM Window Debug Info ===');
-            console.log('Current layout:', currentLayout);
             console.log('Has code:', hasCode);
             console.log('Is interactive:', isInteractive);
-            console.log('Scrollable elements:', scrollableElements.length);
-            
+            console.log('Response index:', responseIndex);
+
             const loadingElement = document.getElementById('loading');
             const responseElement = document.getElementById('response-content');
         };
@@ -1036,6 +1112,17 @@
                 });
             }
         })();
+    </script>
+    <!-- PrismJS core, autoloader, and line-numbers plugin. Loaded at the
+         end of body (after buildEntryNode/etc. are defined) so an answer
+         arriving very early can't race a not-yet-loaded Prism — the
+         `typeof Prism !== 'undefined'` guards already in the code handle
+         that gracefully either way. -->
+    <script src="./node_modules/prismjs/prism.min.js"></script>
+    <script src="./node_modules/prismjs/plugins/autoloader/prism-autoloader.min.js"></script>
+    <script src="./node_modules/prismjs/plugins/line-numbers/prism-line-numbers.min.js"></script>
+    <script>
+        try { if (window.Prism && Prism.plugins && Prism.plugins.autoloader) { Prism.plugins.autoloader.languages_path = './node_modules/prismjs/components/'; } } catch (_) {}
     </script>
 </body>
 </html>
