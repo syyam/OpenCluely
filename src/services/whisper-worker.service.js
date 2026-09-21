@@ -11,17 +11,18 @@ class WhisperWorkerService {
     this.scriptPath = null;
     this.pending = new Map();
     this.sequence = 0;
-    this.idleTimer = null;
-    this.idleUnloadMs = 60000;
     this.readyInfo = null;
     this.closing = false;
   }
 
-  configure({ pythonPath, scriptPath, idleUnloadMs = 60000 }) {
+  // GPU stays loaded for the whole app session once warmed — reloading the
+  // model after every idle gap was costing several seconds per request (see
+  // the idle-unload removal below). It's released only on app quit, via
+  // close() (called from speechService.shutdown()).
+  configure({ pythonPath, scriptPath }) {
     const changed = this.pythonPath !== pythonPath || this.scriptPath !== scriptPath;
     this.pythonPath = pythonPath;
     this.scriptPath = scriptPath;
-    this.idleUnloadMs = idleUnloadMs;
     if (changed) {
       this.close();
     }
@@ -40,8 +41,7 @@ class WhisperWorkerService {
     if (!this.isConfigured()) {
       throw new Error('Persistent Whisper worker is not configured');
     }
-    this._clearIdleTimer();
-    const result = await this._request({
+    return this._request({
       action: 'transcribe',
       audio_path: audioPath,
       model: options.model || 'small',
@@ -49,27 +49,18 @@ class WhisperWorkerService {
       model_dir: options.modelDir || null,
       device: options.device || 'auto'
     });
-    this._scheduleIdleUnload();
-    return result;
   }
 
   async warmup(options = {}) {
     if (!this.isConfigured()) {
       throw new Error('Persistent Whisper worker is not configured');
     }
-    this._clearIdleTimer();
     return this._request({
       action: 'warmup',
       model: options.model || 'small',
       model_dir: options.modelDir || null,
       device: options.device || 'auto'
     });
-  }
-
-  releaseWhenIdle() {
-    if (this.process) {
-      this._scheduleIdleUnload();
-    }
   }
 
   _ensureProcess() {
@@ -167,25 +158,6 @@ class WhisperWorkerService {
     });
   }
 
-  _scheduleIdleUnload() {
-    this._clearIdleTimer();
-    this.idleTimer = setTimeout(() => {
-      if (!this.process || this.pending.size > 0) {
-        return;
-      }
-      this._request({ action: 'unload' }, 30000)
-        .then(() => logger.info('Whisper model unloaded after idle timeout'))
-        .catch((error) => logger.warn('Could not unload idle Whisper model', { error: error.message }));
-    }, this.idleUnloadMs);
-  }
-
-  _clearIdleTimer() {
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
-    }
-  }
-
   _rejectAll(error) {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
@@ -195,7 +167,6 @@ class WhisperWorkerService {
   }
 
   close() {
-    this._clearIdleTimer();
     if (this.process && !this.process.killed) {
       try {
         this.closing = true;

@@ -123,7 +123,6 @@ WHISPER_PYTHON=
 WHISPER_CAPTURE_MODE=vad
 WHISPER_RESPONSE_TARGET=both
 WHISPER_MANUAL_MAX_MS=90000
-WHISPER_GPU_IDLE_MS=60000
 ```
 
 Speech is optional. If no provider is configured, the microphone button hides itself across the app.

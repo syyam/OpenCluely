@@ -1008,7 +1008,9 @@ class SpeechService extends EventEmitter {
     } finally {
       this._cleanup();
       this.isProcessingAudio = false;
-      this.whisperWorker.releaseWhenIdle();
+      // The GPU-loaded Whisper worker deliberately stays warm for the whole
+      // app session now, not just between utterances — it's only released
+      // on app quit (speechService.shutdown() -> whisperWorker.close()).
       if (!captureAlreadyStopped) {
         this.emit('recording-stopped');
       }
@@ -1108,7 +1110,8 @@ class SpeechService extends EventEmitter {
     }
 
     if (this.provider === 'whisper') {
-      return this._transcribeWhisperFile(audioFilePath);
+      const result = await this._transcribeWhisperFile(audioFilePath);
+      return result ? result.text : '';
     }
 
     throw new Error('Speech service not initialized');
@@ -1396,15 +1399,13 @@ class SpeechService extends EventEmitter {
   _configureWhisperWorker() {
     const pythonPath = this._getWhisperPythonPath();
     const scriptPath = this._getWhisperWorkerScriptPath();
-    const idleUnloadMs = Math.max(10000, Number(process.env.WHISPER_GPU_IDLE_MS || 60000));
-    this.whisperWorker.configure({ pythonPath, scriptPath, idleUnloadMs });
+    this.whisperWorker.configure({ pythonPath, scriptPath });
 
     logger.info('Whisper worker configuration', {
       configured: this.whisperWorker.isConfigured(),
       pythonPath,
       scriptPath,
-      device: this._getWhisperDevice(),
-      idleUnloadMs
+      device: this._getWhisperDevice()
     });
   }
 
@@ -1831,12 +1832,14 @@ class SpeechService extends EventEmitter {
     this.transcriptionInFlight = true;
 
     try {
-      const transcript = await this._transcribeWhisperBuffer(audioBuffer);
+      const result = await this._transcribeWhisperBuffer(audioBuffer);
+      const transcript = result ? result.text : '';
+      const detectedLanguage = result ? result.language : null;
       const clean = transcript ? transcript.trim() : '';
-      if (clean && !this._isHallucinatedTranscript(clean)) {
+      if (clean && !this._isHallucinatedTranscript(clean, detectedLanguage)) {
         this.emit('transcription', clean);
       } else if (clean) {
-        logger.debug('Dropped likely Whisper silence hallucination', { transcript: clean });
+        logger.debug('Dropped likely Whisper hallucination/noise', { transcript: clean, detectedLanguage });
       }
     } finally {
       this.transcriptionInFlight = false;
@@ -1852,15 +1855,33 @@ class SpeechService extends EventEmitter {
 
   /**
    * Whisper reliably hallucinates a small set of stock phrases when fed near-
-   * silence or non-speech audio (training-data artifacts from video captions).
-   * VAD already prevents most silent flushes; this is the final guard so these
-   * phantom phrases never reach the chat or the LLM.
+   * silence or non-speech audio (training-data artifacts from video captions
+   * and subtitles). VAD already prevents most silent flushes; this is the
+   * final guard so these phantom phrases never reach the chat or the LLM.
+   *
+   * Three independent signals, any one of which drops the transcript:
+   *  1. An exact match against a small set of known stock hallucination
+   *     phrases (cheap, catches the most common English ones).
+   *  2. Excessive word/phrase repetition — hallucinated noise transcripts
+   *     reliably degenerate into a short unit repeated many times (e.g.
+   *     "T-T-T-T-T...", "thank you thank you thank you...", "I'm going to
+   *     go back to the video" x9). Real speech essentially never does this.
+   *  3. Detected language outside the allowed set — this app is used for
+   *     English/Japanese interview practice, so Whisper confidently
+   *     "detecting" Russian/Icelandic/etc. on what was actually background
+   *     noise (observed live: 26x "Продолжение следует...", 5x "Спасибо...")
+   *     is a strong noise signal on its own. Only applied when a detected
+   *     language was actually returned — never drops on an unknown language.
    */
-  _isHallucinatedTranscript(text) {
-    const normalized = text.toLowerCase().replace(/[\s.,!?¡¿"'`]+/g, ' ').trim();
+  _isHallucinatedTranscript(text, detectedLanguage = null) {
+    // Hyphens are treated as word separators too, not just stripped — a
+    // hallucinated "T-T-T-T-T..." loop has no whitespace at all otherwise,
+    // which would hide it from the repetition check below (single "word").
+    const normalized = text.toLowerCase().replace(/[\s.,!?¡¿"'`-]+/g, ' ').trim();
     if (!normalized) {
       return true;
     }
+
     const HALLUCINATIONS = new Set([
       'thank you',
       'thank you for watching',
@@ -1877,7 +1898,60 @@ class SpeechService extends EventEmitter {
       'the end',
       'subtitles by the amara org community'
     ]);
-    return HALLUCINATIONS.has(normalized);
+    if (HALLUCINATIONS.has(normalized)) {
+      return true;
+    }
+
+    if (this._hasExcessiveRepetition(normalized)) {
+      return true;
+    }
+
+    const ALLOWED_TRANSCRIPT_LANGUAGES = new Set(['en', 'ja']);
+    if (detectedLanguage && !ALLOWED_TRANSCRIPT_LANGUAGES.has(String(detectedLanguage).toLowerCase())) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Generic loop detector: true if the text is dominated by a short word
+   * sequence repeated many times back-to-back. Checks repeat-unit lengths
+   * from a single word up to a 10-word phrase, requiring more repeats for
+   * shorter units (a real "no no no" is fine; "no" x5 in a row is not) and
+   * fewer for longer ones (three back-to-back repeats of an 8-word phrase
+   * is already well past anything a real speaker would say).
+   */
+  _hasExcessiveRepetition(normalizedText) {
+    const words = normalizedText.split(/\s+/).filter(Boolean);
+    if (words.length < 6) {
+      return false;
+    }
+
+    for (let unitLen = 1; unitLen <= 10; unitLen++) {
+      const minRepeats = unitLen <= 1 ? 5 : unitLen <= 3 ? 4 : 3;
+      if (words.length < unitLen * minRepeats) {
+        continue;
+      }
+
+      const unit = words.slice(0, unitLen).join(' ');
+      let repeats = 0;
+      for (let i = 0; i < words.length; i += unitLen) {
+        const chunk = words.slice(i, i + unitLen).join(' ');
+        if (chunk === unit) {
+          repeats++;
+        } else {
+          break;
+        }
+      }
+
+      const coveredWords = repeats * unitLen;
+      if (repeats >= minRepeats && coveredWords / words.length >= 0.7) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   async _transcribeWhisperBuffer(audioBuffer) {
@@ -1913,7 +1987,7 @@ class SpeechService extends EventEmitter {
           gpu: result.gpu,
           detectedLanguage: result.language
         });
-        return result.text || '';
+        return { text: result.text || '', language: result.language || null };
       } catch (error) {
         logger.warn('Persistent Whisper worker failed; falling back to CLI', {
           error: error.message,
@@ -1928,7 +2002,7 @@ class SpeechService extends EventEmitter {
       audioFilePath,
       '--model', this._getWhisperModel(),
       '--task', 'transcribe',
-      '--output_format', 'txt',
+      '--output_format', 'json',
       '--output_dir', outputDir,
       '--verbose', 'False',
       '--fp16', 'False'
@@ -1968,12 +2042,18 @@ class SpeechService extends EventEmitter {
         });
       });
 
-      const transcriptPath = path.join(outputDir, `${path.parse(audioFilePath).name}.txt`);
+      const transcriptPath = path.join(outputDir, `${path.parse(audioFilePath).name}.json`);
       if (!fs.existsSync(transcriptPath)) {
-        return '';
+        return { text: '', language: null };
       }
 
-      return fs.readFileSync(transcriptPath, 'utf8').trim();
+      try {
+        const parsed = JSON.parse(fs.readFileSync(transcriptPath, 'utf8'));
+        return { text: (parsed.text || '').trim(), language: parsed.language || null };
+      } catch (error) {
+        logger.warn('Failed to parse Whisper CLI JSON output', { error: error.message });
+        return { text: '', language: null };
+      }
     } finally {
       this._removeTempDir(outputDir);
     }

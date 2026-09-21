@@ -2,6 +2,9 @@ const { GoogleGenAI } = require('@google/genai');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
+const { getCandidateContextBlock, isPersonalContextRelevant } = require('../core/candidate-context');
+const { getInterviewMetadataBlock } = require('../core/interview-metadata');
+const responseLanguage = require('../core/response-language');
 
 class LLMService {
   constructor() {
@@ -559,7 +562,7 @@ class LLMService {
     
     if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
       const conversationHistory = sessionManager.getConversationHistory(15);
-      const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
+      const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage, text);
       return this.buildGeminiRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage);
     }
 
@@ -676,7 +679,7 @@ class LLMService {
     
     if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
       const conversationHistory = sessionManager.getConversationHistory(10);
-      const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
+      const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage, cleanText);
       return this.buildIntelligentTranscriptionRequestWithHistory(cleanText, activeSkill, conversationHistory, skillContext, programmingLanguage);
     }
 
@@ -688,7 +691,7 @@ class LLMService {
     this.applyGenerationDefaults(request);
 
     // Add intelligent filtering system instruction
-    const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage);
+    const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage, cleanText);
     if (!intelligentPrompt) {
       throw new Error('Failed to generate intelligent transcription prompt');
     }
@@ -720,7 +723,7 @@ class LLMService {
     this.applyGenerationDefaults(request);
 
   // For chat/transcription messages, DO NOT include the full skill prompt; use only the intelligent filter prompt
-  const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage);
+  const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage, text);
   request.systemInstruction = { parts: [{ text: intelligentPrompt }] };
 
     // Add recent conversation history (excluding system messages) with validation
@@ -778,18 +781,21 @@ class LLMService {
     return request;
   }
 
-  getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage) {
+  getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage, questionText = null) {
+    // activeSkill doubles as the active resume profile (android/frontend/
+    // fullstack — see src/core/candidate-context.js and prompts/*.md), no
+    // longer a manually-selected UI skill. Wording below stays profile-
+    // agnostic since all three profiles share the same "never refuse" rule.
     let prompt = `# Intelligent Transcription Response System
 
-Assume you are asked a question in ${activeSkill.toUpperCase()} mode. Your job is to intelligently respond to question/message with appropriate brevity.
-Assume you are in an interview and you need to perform best in ${activeSkill.toUpperCase()} mode.
-Always respond to the point, do not repeat the question or unnecessary information which is not related to ${activeSkill}.`;
+You are assisting a candidate live during a software engineering interview (DSA/algorithms, general programming, Android/Kotlin/mobile, system design, and behavioral questions may all come up in the same conversation). Your job is to respond to each transcribed snippet with appropriate brevity and always be genuinely helpful — never refuse or deflect a question as "not relevant."
+Always respond to the point: do not repeat the question back, and do not include unnecessary preamble.`;
 
     // Add programming language context if provided
     if (programmingLanguage) {
       const lang = String(programmingLanguage).toLowerCase();
-      const languageMap = { cpp: 'C++', c: 'C', python: 'Python', java: 'Java', javascript: 'JavaScript', js: 'JavaScript' };
-      const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
+      const languageMap = { cpp: 'C++', c: 'C', kotlin: 'Kotlin', python: 'Python', java: 'Java', javascript: 'JavaScript', js: 'JavaScript' };
+      const fenceTagMap = { cpp: 'cpp', c: 'c', kotlin: 'kotlin', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
       const languageTitle = languageMap[lang] || (lang.charAt(0).toUpperCase() + lang.slice(1));
       const fenceTag = fenceTagMap[lang] || lang || 'text';
       prompt += `\n\nCODING CONTEXT: Respond ONLY in ${languageTitle}. All code blocks must use triple backticks with language tag \`\`\`${fenceTag}\`\`\`. Do not include other languages unless explicitly asked.`;
@@ -799,37 +805,30 @@ Always respond to the point, do not repeat the question or unnecessary informati
 
 ## Response Rules:
 
-### If the transcription is casual conversation, greetings, or NOT related to ${activeSkill}:
-- Respond with: "Yeah, I'm listening. Ask your question relevant to ${activeSkill}."
-- Or similar brief acknowledgments like: "I'm here, what's your ${activeSkill} question?"
-
-### If the transcription IS relevant to ${activeSkill} or is a follow-up question:
-- Provide a comprehensive, detailed response
-- Use bullet points, examples, and explanations
-- Focus on actionable insights and complete answers
-- Do not truncate or shorten your response
-
-### Examples of casual/irrelevant messages:
-- "Hello", "Hi there", "How are you?"
-- "What's the weather like?"
-- "I'm just testing this"
-- Random conversations not related to ${activeSkill}
-
-### Examples of relevant messages:
-- Actual questions about ${activeSkill} concepts
-- Follow-up questions to previous responses
-- Requests for clarification on ${activeSkill} topics
-- Problem-solving requests related to ${activeSkill}
+- Always give a real, direct, complete answer to whatever the candidate says. A live interview transcript can jump between DSA, general coding, Android/Kotlin, system design, and behavioral questions — answer whatever comes up, in full.
+- For genuinely pure social small talk with zero technical content (e.g. a bare "hello", "how are you", "can you hear me") — give a brief, natural one-line acknowledgment instead of a long technical answer, then stop.
+- If a message has any technical content or an actual question in it, treat it as real and answer it fully — do not mistake casual phrasing for small talk, and never dismiss a message as "not relevant."
+- For real questions: provide a comprehensive, detailed response — use bullet points, examples, and explanations; focus on actionable insights and complete answers; do not truncate or shorten your response.
+- Only include a code block when the message is actually a coding/implementation/debugging question — a selected programming language does not mean every response needs code.
+- For coding/DSA/algorithm questions specifically, structure the answer in this order: (1) problem understanding in plain language, (2) step-by-step approach, (3) simple code first with light inline comments on non-obvious lines only, (4) time complexity, (5) space complexity, (6) brief why-it-works explanation — then an optimized version afterward, in the same order, only if it's meaningfully better than the simple one.
 
 ## Response Format:
-- Keep responses detailed
-- Use bullet points for structured answers
-- Be encouraging and helpful
-- Stay focused on ${activeSkill}
+- Keep responses detailed and structured (bullet points over long paragraphs).
+- Be encouraging and helpful.
 
 If the user's input is a coding or DSA problem statement and contains no code, produce a complete, runnable solution in the selected programming language without asking for more details. Always include the final implementation in a properly tagged code block.
 
-Remember: Be intelligent about filtering - only provide detailed responses when the user actually needs help with ${activeSkill}.`;
+Remember: brevity means cutting filler, not withholding a real answer. When in doubt about whether something needs a full answer, give one.`;
+
+    // Same token-savings gate as getSkillPrompt() in prompt-loader.js — only
+    // pay the ~1,500-1,800 token resume/metadata cost when it's likely to
+    // matter (behavioral question) or Japanese mode is on (can't self-
+    // translate resume facts into romaji, so needs it available always).
+    if (responseLanguage.isJapaneseModeEnabled() || isPersonalContextRelevant(questionText)) {
+      prompt += getCandidateContextBlock(activeSkill);
+      prompt += getInterviewMetadataBlock();
+    }
+    prompt += responseLanguage.getJapaneseModeInstructionBlock();
 
     return prompt;
   }
@@ -930,12 +929,17 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
             model: modelName
           });
 
-          // For model-unavailable / overloaded / rate-limit errors, move to
-          // the next fallback model immediately instead of burning all retries.
+          // For model-unavailable / overloaded / rate-limit / retired-model
+          // errors, move to the next fallback model immediately instead of
+          // burning all retries — a 404/NOT_FOUND means the model is gone
+          // and will never succeed no matter how many times it's retried.
           const isModelUnavailable = errorInfo.type === 'RATE_LIMIT_ERROR' ||
             error.message.includes('503') ||
             error.message.includes('UNAVAILABLE') ||
-            error.message.includes('high demand');
+            error.message.includes('high demand') ||
+            error.message.includes('404') ||
+            error.message.includes('NOT_FOUND') ||
+            error.message.includes('no longer available');
 
           if (isModelUnavailable && modelName !== modelsToTry[modelsToTry.length - 1]) {
             logger.info(`Switching to fallback model after ${modelName} unavailable`, {
@@ -1092,7 +1096,10 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
           const isModelUnavailable = errorInfo.type === 'RATE_LIMIT_ERROR' ||
             error.message.includes('503') ||
             error.message.includes('UNAVAILABLE') ||
-            error.message.includes('high demand');
+            error.message.includes('high demand') ||
+            error.message.includes('404') ||
+            error.message.includes('NOT_FOUND') ||
+            error.message.includes('no longer available');
 
           if (isModelUnavailable && modelName !== modelsToTry[modelsToTry.length - 1]) {
             break; // try next fallback model
@@ -1349,34 +1356,18 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
   generateIntelligentFallbackResponse(text, activeSkill) {
     logger.info('Generating intelligent fallback response for transcription', { activeSkill });
 
-    // Simple heuristic to determine if message seems skill-related
-    const skillKeywords = {
-      'dsa': ['algorithm', 'data structure', 'array', 'tree', 'graph', 'sort', 'search', 'complexity', 'big o'],
-      'programming': ['code', 'function', 'variable', 'class', 'method', 'bug', 'debug', 'syntax'],
-      'system-design': ['scalability', 'database', 'architecture', 'microservice', 'load balancer', 'cache'],
-      'behavioral': ['interview', 'experience', 'situation', 'leadership', 'conflict', 'team'],
-      'sales': ['customer', 'deal', 'negotiation', 'price', 'revenue', 'prospect'],
-      'presentation': ['slide', 'audience', 'public speaking', 'presentation', 'nervous'],
-      'data-science': ['data', 'model', 'machine learning', 'statistics', 'analytics', 'python', 'pandas'],
-      'devops': ['deployment', 'ci/cd', 'docker', 'kubernetes', 'infrastructure', 'monitoring'],
-      'negotiation': ['negotiate', 'compromise', 'agreement', 'terms', 'conflict resolution']
-    };
+    // This only runs when the actual Gemini API call threw (network/API
+    // failure) — it's an honest "something went wrong" message, not a
+    // relevance judgment. It used to guess relevance from skill-specific
+    // keywords and fall back to a "not relevant" refusal when nothing
+    // matched, which could misfire on real questions (e.g. "explain merge
+    // sort" has no question word/'?') and silently violate "never refuse."
+    // This is the one code path that bypasses prompt construction entirely
+    // (the API call itself failed, so there's no systemInstruction to
+    // append a language block to) — it needs its own language-aware copy so
+    // Japanese mode doesn't silently break here.
+    const response = responseLanguage.getFallbackMessage();
 
-    const textLower = text.toLowerCase();
-    const relevantKeywords = skillKeywords[activeSkill] || [];
-    const hasRelevantKeywords = relevantKeywords.some(keyword => textLower.includes(keyword));
-    
-    // Check for question indicators
-    const questionIndicators = ['how', 'what', 'why', 'when', 'where', 'can you', 'could you', 'should i', '?'];
-    const seemsLikeQuestion = questionIndicators.some(indicator => textLower.includes(indicator));
-
-    let response;
-    if (hasRelevantKeywords || seemsLikeQuestion) {
-      response = `I'm having trouble processing that right now, but it sounds like a ${activeSkill} question. Could you rephrase or ask more specifically about what you need help with?`;
-    } else {
-      response = `Yeah, I'm listening. Ask your question relevant to ${activeSkill}.`;
-    }
-    
     return {
       response,
       metadata: {
@@ -1448,7 +1439,10 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
             error.message.includes('UNAVAILABLE') ||
             error.message.includes('high demand') ||
             error.message.includes('quota') ||
-            error.message.includes('rate limit');
+            error.message.includes('rate limit') ||
+            error.message.includes('404') ||
+            error.message.includes('NOT_FOUND') ||
+            error.message.includes('no longer available');
 
           if (!isModelUnavailable && modelName === this.model) {
             // Primary model failed for a non-availability reason; don't hide it
@@ -1555,7 +1549,10 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
 
         const isModelUnavailable = error.message.includes('503') ||
           error.message.includes('UNAVAILABLE') ||
-          error.message.includes('high demand');
+          error.message.includes('high demand') ||
+          error.message.includes('404') ||
+          error.message.includes('NOT_FOUND') ||
+          error.message.includes('no longer available');
 
         if (!isModelUnavailable && modelName === primaryModel) {
           break;

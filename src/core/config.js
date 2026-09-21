@@ -40,8 +40,13 @@ class ConfigManager {
 
       llm: {
         gemini: {
-          model: 'gemini-3.1-flash-lite',
-          fallbackModels: ['gemini-2.5-flash-lite', 'gemini-3.5-flash'],
+          model: process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite',
+          // gemini-2.5-flash-lite was retired (404 "no longer available to
+          // new users" as of 2026-09) — Google's own error message points
+          // at gemini-3.5-flash-lite as the replacement. A dead model in
+          // this list used to burn the full retry budget (~13s of backoff)
+          // on every request before falling through to the next one.
+          fallbackModels: ['gemini-3.5-flash-lite', 'gemini-3.5-flash'],
           maxRetries: 3,
           timeout: 30000,
           fallbackEnabled: true,

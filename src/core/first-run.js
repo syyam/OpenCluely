@@ -160,7 +160,6 @@ class FirstRunManager {
       'WHISPER_CAPTURE_MODE=vad',
       'WHISPER_RESPONSE_TARGET=both',
       'WHISPER_MANUAL_MAX_MS=90000',
-      'WHISPER_GPU_IDLE_MS=60000',
       'WHISPER_SEGMENT_MS=4000',
       ''
     ].join(os.EOL);
