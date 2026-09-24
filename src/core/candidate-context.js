@@ -6,12 +6,18 @@ const path = require('path');
 // both which resume gets injected into Gemini's context AND which prompt
 // depth (Android/Frontend/Full-Stack) is used, via the same activeSkill
 // value threaded through main.js/prompt-loader.js/llm.service.js.
+// defaultLanguage is the coding language selected when switching TO that
+// profile; the user can still pick any language afterwards and that wins.
 const PROFILES = {
-  android: { label: 'Android' },
-  frontend: { label: 'Frontend' },
-  fullstack: { label: 'Full-Stack' },
+  android: { label: 'Android', defaultLanguage: 'kotlin' },
+  frontend: { label: 'Frontend', defaultLanguage: 'typescript' },
+  fullstack: { label: 'Full-Stack', defaultLanguage: 'typescript' },
 };
 const DEFAULT_PROFILE = 'android';
+
+function getProfileDefaultLanguage(profileId) {
+  return PROFILES[normalizeProfileId(profileId)].defaultLanguage;
+}
 
 function getProfileList() {
   return Object.entries(PROFILES).map(([id, meta]) => ({ id, label: meta.label }));
@@ -100,6 +106,7 @@ module.exports = {
   DEFAULT_PROFILE,
   getProfileList,
   normalizeProfileId,
+  getProfileDefaultLanguage,
   resolveProfilesDir,
   resolveProfilePath,
   readCandidateContext,

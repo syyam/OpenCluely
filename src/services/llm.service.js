@@ -608,9 +608,12 @@ class LLMService {
     try {
       if (!text || !programmingLanguage) return text;
       const norm = String(programmingLanguage).toLowerCase();
-      const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
+      const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript', typescript: 'typescript', ts: 'typescript' };
       const fenceTag = fenceTagMap[norm] || norm || 'text';
       const keepTags = new Set(['text', 'plaintext', 'txt', 'diff', 'bash', 'sh', 'shell', 'console', 'sql', 'json', 'yaml', 'yml', 'xml', 'html', 'css']);
+      // React component blocks stay tsx/jsx under their base language.
+      if (fenceTag === 'typescript') keepTags.add('tsx');
+      if (fenceTag === 'javascript') keepTags.add('jsx');
 
       let openFence = null; // '```' or '~~~' while inside a code block
       return text.split('\n').map(line => {

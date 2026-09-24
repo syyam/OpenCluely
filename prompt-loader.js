@@ -95,8 +95,8 @@ class PromptLoader {
    * @returns {string} Modified prompt with programming language context
    */
   injectProgrammingLanguage(promptContent, programmingLanguage, skillName) {
-    const languageMap = { cpp: 'C++', c: 'C', kotlin: 'Kotlin', python: 'Python', java: 'Java', javascript: 'JavaScript', js: 'JavaScript' };
-    const fenceTagMap = { cpp: 'cpp', c: 'c', kotlin: 'kotlin', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
+    const languageMap = { cpp: 'C++', c: 'C', kotlin: 'Kotlin', python: 'Python', java: 'Java', javascript: 'JavaScript', js: 'JavaScript', typescript: 'TypeScript', ts: 'TypeScript' };
+    const fenceTagMap = { cpp: 'cpp', c: 'c', kotlin: 'kotlin', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript', typescript: 'typescript', ts: 'typescript' };
     const norm = (programmingLanguage || '').toLowerCase();
     const languageTitle = languageMap[norm] || (programmingLanguage.charAt(0).toUpperCase() + programmingLanguage.slice(1));
     const fenceTag = fenceTagMap[norm] || norm || 'text';

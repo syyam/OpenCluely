@@ -119,8 +119,9 @@ class ApplicationController {
     // activeSkill doubles as the active resume-profile id (android/frontend/
     // fullstack) — see src/core/candidate-context.js. Android is default.
     this.activeSkill = candidateContext.DEFAULT_PROFILE;
-  // Default to Kotlin so language is enforced from first run
-  this.codingLanguage = "kotlin";
+  // Start on the default profile's language (Kotlin for Android) so a
+  // language is enforced from first run.
+  this.codingLanguage = candidateContext.getProfileDefaultLanguage(this.activeSkill);
   // Global romaji-only Japanese response mode — orthogonal to activeSkill,
   // read from response-language.js's persisted flag on startup.
   this.japaneseMode = responseLanguage.isJapaneseModeEnabled();
@@ -1738,7 +1739,7 @@ class ApplicationController {
     // using. Empty strings are returned rather than skipped so the UI can
     // distinguish "unset" from "stale value from a previous load".
     return {
-      codingLanguage: this.codingLanguage || "kotlin",
+      codingLanguage: this.codingLanguage || candidateContext.getProfileDefaultLanguage(this.activeSkill),
       appIcon: this.appIcon || "terminal",
       selectedIcon: this.appIcon || "terminal",
       windowGap: windowManager.windowGap,
@@ -1794,8 +1795,20 @@ class ApplicationController {
       // resumeContext below so a combined {resumeProfile, resumeContext}
       // save (switching profile while editing) lands on the right file.
       if (settings.resumeProfile && Object.prototype.hasOwnProperty.call(candidateContext.PROFILES, settings.resumeProfile)) {
+        const profileChanged = settings.resumeProfile !== this.activeSkill;
         this.activeSkill = settings.resumeProfile;
         sessionManager.setActiveSkill(settings.resumeProfile);
+        // Switching profile selects that profile's default language
+        // (Android → Kotlin, Frontend/Full-Stack → TypeScript) and updates
+        // every language dropdown. An explicit codingLanguage in the same
+        // save (already applied above) wins, and so does any later pick
+        // from the language dropdown.
+        if (profileChanged && !settings.codingLanguage) {
+          this.codingLanguage = candidateContext.getProfileDefaultLanguage(settings.resumeProfile);
+          windowManager.broadcastToAllWindows("coding-language-changed", {
+            language: this.codingLanguage,
+          });
+        }
       }
       // Resume/background text — stored in its own file per profile, not
       // .env (see candidate-context.js: .env values get newline-collapsed
