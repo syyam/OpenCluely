@@ -159,6 +159,9 @@
         .entry-body.no-code {
             display: block;
         }
+        /* An answer with several code blocks has one row per block
+           (explanation + its code), stacked. */
+        .entry-body + .entry-body { margin-top: 0.75rem; }
         .entry-text { min-width: 0; }
         .entry-code { min-width: 0; }
 
@@ -981,17 +984,12 @@
         // not touch the DOM outside the node it returns. `meta` carries the
         // answer's messageId / parentMessageId / usedFallback.
         function buildEntryNode(response, index, meta = {}) {
-            const codeBlocks = extractCodeBlocks(response);
+            // Only real code goes to the code column; ```text blocks
+            // (diagrams, plain output) stay inline with their prose.
+            const codeBlocks = extractCodeBlocks(response).filter(b => !INLINE_FENCE_TAGS.has(b.language.toLowerCase()));
             const hasCodeLocal = codeBlocks.length > 0;
             hasCode = hasCodeLocal;
             const isExpansion = !!meta.parentMessageId;
-
-            let textContent = response;
-            codeBlocks.forEach(block => {
-                textContent = textContent.replace(block.fullMatch, '');
-            });
-            textContent = textContent.replace(/\n\s*\n\s*\n/g, '\n\n').trim();
-            const textHtml = renderMarkdown(textContent);
 
             const entry = document.createElement('div');
             entry.className = isExpansion ? 'response-entry expansion' : 'response-entry';
@@ -1004,40 +1002,53 @@
             divider.innerHTML = `<span>${entryLabel(index, isExpansion)}</span><span>${new Date().toLocaleTimeString()}</span>`;
             entry.appendChild(divider);
 
-            const body = document.createElement('div');
-            body.className = hasCodeLocal ? 'entry-body has-code' : 'entry-body no-code';
-            entry.appendChild(body);
+            // One row per code block: the explanation written right before
+            // that block on the left, the block itself on the right — so
+            // "Implementation" sits beside its code and "Optimized solution"
+            // beside its own. Text after the last block is a full-width row.
+            const segments = [];
+            let cursor = 0;
+            codeBlocks.forEach(block => {
+                segments.push({ text: response.slice(cursor, block.index), block });
+                cursor = block.index + block.fullMatch.length;
+            });
+            segments.push({ text: response.slice(cursor), block: null });
 
-            const textEl = document.createElement('div');
-            textEl.className = 'markdown-content entry-text';
-            textEl.innerHTML = textHtml;
-            body.appendChild(textEl);
-            if (window.renderMathInElement) window.renderMathInElement(textEl);
+            segments.forEach(seg => {
+                const segText = seg.text.replace(/\n\s*\n\s*\n/g, '\n\n').trim();
+                if (!segText && !seg.block) return;
 
-            if (hasCodeLocal) {
+                const body = document.createElement('div');
+                body.className = seg.block ? 'entry-body has-code' : 'entry-body no-code';
+                entry.appendChild(body);
+
+                const textEl = document.createElement('div');
+                textEl.className = 'markdown-content entry-text';
+                textEl.innerHTML = renderMarkdown(segText);
+                body.appendChild(textEl);
+                if (window.renderMathInElement) window.renderMathInElement(textEl);
+
+                if (!seg.block) return;
+                const block = seg.block;
                 const codeEl = document.createElement('div');
                 codeEl.className = 'entry-code';
 
-                codeBlocks.forEach(block => {
-                    const codeBlock = document.createElement('div');
-                    codeBlock.className = 'code-block';
-                    codeBlock.innerHTML = `
-                        <div class="code-header">${block.language.toUpperCase()}</div>
-                        <div class="code-content">
-                            <pre class="line-numbers"><code class="language-${block.language}">${escapeHtml(block.code)}</code></pre>
-                        </div>
-                    `;
-                    const pre = codeBlock.querySelector('pre');
-                    pre.style.position = 'relative';
-                    const btn = document.createElement('button');
-                    btn.className = 'copy-btn';
-                    btn.textContent = 'Copy';
-                    attachCopy(btn, block.code || '');
-                    pre.appendChild(btn);
-
-                    codeEl.appendChild(codeBlock);
-                });
-
+                const codeBlock = document.createElement('div');
+                codeBlock.className = 'code-block';
+                codeBlock.innerHTML = `
+                    <div class="code-header">${block.language.toUpperCase()}</div>
+                    <div class="code-content">
+                        <pre class="line-numbers"><code class="language-${block.language}">${escapeHtml(block.code)}</code></pre>
+                    </div>
+                `;
+                const pre = codeBlock.querySelector('pre');
+                pre.style.position = 'relative';
+                const btn = document.createElement('button');
+                btn.className = 'copy-btn';
+                btn.textContent = 'Copy';
+                attachCopy(btn, block.code || '');
+                pre.appendChild(btn);
+                codeEl.appendChild(codeBlock);
                 body.appendChild(codeEl);
 
                 if (typeof Prism !== 'undefined') {
@@ -1047,7 +1058,7 @@
                         Prism.highlightAll();
                     }
                 }
-            }
+            });
 
             // "More details" — only on a real finished answer (not on a
             // fallback "could you repeat" reply, and not on an expansion).
@@ -1186,6 +1197,10 @@
             console.log('Wheel scroll detected on element');
         }
 
+        // Fence tags rendered inline with the prose (diagrams, plain output)
+        // instead of in the side code column.
+        const INLINE_FENCE_TAGS = new Set(['text', 'plaintext', 'txt']);
+
         function extractCodeBlocks(text) {
             const blocks = [];
             if (!text) return blocks;
@@ -1194,7 +1209,7 @@
             while ((match = regex.exec(text)) !== null) {
                 const info = (match[2] || '').trim();
                 const langToken = info.split(/\s+/)[0] || 'text';
-                blocks.push({ language: langToken, code: match[3], fullMatch: match[0] });
+                blocks.push({ language: langToken, code: match[3], fullMatch: match[0], index: match.index });
             }
             return blocks;
         }

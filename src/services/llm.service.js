@@ -598,8 +598,11 @@ class LLMService {
   }
 
   /**
-   * Normalize all triple-backtick code fences to the selected programming language tag.
-   * Does not alter the inner code; only ensures fence language tags are correct.
+   * Normalize OPENING code fences to the selected programming language tag.
+   * Closing fences are left bare (retagging them would turn them into new
+   * openers and break the markdown/code extraction), and fences tagged as
+   * non-code text (diagrams, shell, data formats) keep their tag. Tilde
+   * fences are normalized to backticks. Does not alter the inner code.
    */
   enforceProgrammingLanguage(text, programmingLanguage) {
     try {
@@ -607,19 +610,25 @@ class LLMService {
       const norm = String(programmingLanguage).toLowerCase();
       const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
       const fenceTag = fenceTagMap[norm] || norm || 'text';
+      const keepTags = new Set(['text', 'plaintext', 'txt', 'diff', 'bash', 'sh', 'shell', 'console', 'sql', 'json', 'yaml', 'yml', 'xml', 'html', 'css']);
 
-      // Replace all triple-backtick fences' language token with the selected tag
-      const replacedBackticks = text.replace(/```([^\n]*)\n/g, (match, info) => {
-        const current = (info || '').trim();
-        // If already the desired fenceTag as the first token, keep as is
-        if (current.split(/\s+/)[0].toLowerCase() === fenceTag) return match;
-        return '```' + fenceTag + '\n';
-      });
-
-      // Optionally normalize tildes fences to backticks with correct tag
-      const normalizedTildes = replacedBackticks.replace(/~~~([^\n]*)\n/g, () => '```' + fenceTag + '\n');
-
-      return normalizedTildes;
+      let openFence = null; // '```' or '~~~' while inside a code block
+      return text.split('\n').map(line => {
+        const m = line.match(/^(\s*)(```|~~~)(.*)$/);
+        if (!m) return line;
+        const [, indent, fence, info] = m;
+        if (openFence) {
+          if (fence === openFence && info.trim() === '') {
+            openFence = null;
+            return indent + '```';
+          }
+          return line; // a fence-like line inside the code itself
+        }
+        openFence = fence;
+        const current = info.trim().split(/\s+/)[0].toLowerCase();
+        const tag = current === fenceTag || keepTags.has(current) ? current : fenceTag;
+        return indent + '```' + tag;
+      }).join('\n');
     } catch (_) {
       return text;
     }

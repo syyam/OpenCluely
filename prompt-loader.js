@@ -4,6 +4,7 @@ const { getCandidateContextBlock } = require('./src/core/candidate-context');
 const { getInterviewMetadataBlock } = require('./src/core/interview-metadata');
 const { getResponseLanguageInstructionBlock } = require('./src/core/response-language');
 const { getIdentityBlock } = require('./src/core/identity');
+const { getCodingAnswerBlock } = require('./src/core/answer-format');
 
 class PromptLoader {
   constructor() {
@@ -74,6 +75,9 @@ class PromptLoader {
     // (visa/relocation/self-intro, profile-independent by design).
     promptContent += getCandidateContextBlock(normalizedSkillName);
     promptContent += getInterviewMetadataBlock();
+    // When an answer gets code and how a coding answer is structured — the
+    // single shared copy for every profile (see src/core/answer-format.js).
+    promptContent += getCodingAnswerBlock();
     // How to voice the answer (as Syyam, no AI self-reference, no filler).
     promptContent += getIdentityBlock();
     // The only thing establishing a default output language (English) when
@@ -98,19 +102,12 @@ class PromptLoader {
     const fenceTag = fenceTagMap[norm] || norm || 'text';
     const languageUpper = (languageMap[norm] || languageTitle).toUpperCase();
     
-    // Same rules for every profile (android/frontend/fullstack/any added
-    // later): code only when the question actually calls for it.
-    const languageInjection = `\n\n## IMPLEMENTATION LANGUAGE (when code is actually needed): ${languageUpper}
-Selecting ${languageTitle} here does NOT mean "include code in every technical answer" — it only means "if code is required, use this language." A technical question is not automatically a coding question; distinguish the two.
-Do NOT include a code block for conceptual/behavioral questions such as: "what is X", "how does X work", "why use X", "what's the difference between X and Y", "tell me about your experience with X", "how did you solve/approach X". Answer these as a concise verbal explanation. If a specific function, class, or library name needs to be mentioned, put it inline as a short code-highlighted span within the prose, not a fenced code block.
-DO include a code block only when: the interviewer explicitly asks to implement/write/code something, the question is a clear coding/algorithm problem, existing code is given and needs debugging/modifying/explaining, or a screenshot clearly shows a coding problem expecting an implementation. Even then, prefer a brief verbal explanation first unless code materially helps answer the question.
-When code IS warranted:
-- Respond ONLY in ${languageTitle}. Do not include any snippets or alternatives in other languages.
-- All code blocks must use triple backticks with the exact language tag: \`\`\`${fenceTag}\`\`\`.
-- Aim for the best possible time and space complexity; prefer optimal algorithms and data structures.
-- Provide: brief approach, then final ${languageTitle} implementation, followed by time/space complexity.
-- If the user's input is a problem statement (and does not include code), produce a complete, runnable ${languageTitle} solution without asking for clarification.
-- Avoid unnecessary verbosity; focus on correctness, clarity, and efficiency.`;
+    // Language selection only — when code is warranted and how a coding
+    // answer is structured live in src/core/answer-format.js.
+    const languageInjection = `
+
+## Implementation language: ${languageUpper}
+When code is needed (see "When code is needed" below), write it ONLY in ${languageTitle} — no snippets or alternatives in other languages — fenced with the exact tag \`\`\`${fenceTag}. Selecting a language does not mean an answer needs code.`;
 
     return promptContent + languageInjection;
   }

@@ -1067,14 +1067,9 @@
         while ((match = regex.exec(text)) !== null) {
           const info = (match[2] || '').trim();
           const langToken = info.split(/\s+/)[0] || 'text';
-          blocks.push({ language: langToken, code: match[3], fullMatch: match[0] });
+          blocks.push({ language: langToken, code: match[3], fullMatch: match[0], index: match.index });
         }
         return blocks;
-      }
-      function stripCodeBlocks(text, blocks) {
-        let result = text || '';
-        blocks.forEach(b => { result = result.replace(b.fullMatch, ''); });
-        return result.replace(/\n\s*\n\s*\n/g, '\n\n').trim();
       }
       function escapeHtml(str) {
         const div = document.createElement('div');
@@ -1170,14 +1165,20 @@
           recentResponseHashes.delete(first);
         }
 
+        // In answer order: each explanation, then the code block it
+        // introduces (so an optimized solution's text precedes its own code).
         const blocks = extractCodeBlocks(response);
-        const textOnly = stripCodeBlocks(response, blocks);
-        // Add text response first (if any)
-        if (textOnly && textOnly.trim().length) {
-          addMessage(textOnly, 'assistant');
-        }
-        // Add each code snippet separately
-        blocks.forEach(b => addCodeSnippet(b.language, b.code));
+        const addText = (t) => {
+          const cleaned = t.replace(/\n\s*\n\s*\n/g, '\n\n').trim();
+          if (cleaned.length) addMessage(cleaned, 'assistant');
+        };
+        let cursor = 0;
+        blocks.forEach(b => {
+          addText(response.slice(cursor, b.index));
+          addCodeSnippet(b.language, b.code);
+          cursor = b.index + b.fullMatch.length;
+        });
+        addText(response.slice(cursor));
       }
 
       // Basic IPC Event Listeners - simplified
