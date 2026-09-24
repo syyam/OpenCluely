@@ -29,6 +29,10 @@
             overflow: hidden;
             height: 100vh;
             width: 100vw;
+            /* Previously unset (fell back to Chromium's default sans-serif) -
+               matches the font stack already used elsewhere in the app
+               (src/styles/common.css) for consistency. */
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
         }
         .content-area {
             -webkit-app-region: no-drag;
@@ -36,7 +40,7 @@
         .markdown-content {
             line-height: 1.6;
             color: white;
-            font-size: 0.875rem;
+            font-size: 0.95rem;
         }
         .markdown-content h1, .markdown-content h2, .markdown-content h3 {
             margin-top: 1.2rem;
@@ -44,12 +48,12 @@
             font-weight: bold;
             color: white;
         }
-        .markdown-content h1 { font-size: 1.2rem; }
-        .markdown-content h2 { font-size: 1.1rem; }
-        .markdown-content h3 { font-size: 1rem; }
-        .markdown-content p { margin-bottom: 0.8rem; color: white; font-size: 0.875rem; }
-        .markdown-content ul, .markdown-content ol { margin-bottom: 0.8rem; padding-left: 1.2rem; font-size: 0.875rem; }
-        .markdown-content li { margin-bottom: 0.4rem; color: white; font-size: 0.875rem; }
+        .markdown-content h1 { font-size: 1.3rem; }
+        .markdown-content h2 { font-size: 1.15rem; }
+        .markdown-content h3 { font-size: 1.05rem; }
+        .markdown-content p { margin-bottom: 0.8rem; color: white; font-size: 0.95rem; }
+        .markdown-content ul, .markdown-content ol { margin-bottom: 0.8rem; padding-left: 1.2rem; font-size: 0.95rem; }
+        .markdown-content li { margin-bottom: 0.4rem; color: white; font-size: 0.95rem; }
         .markdown-content code {
             background-color: rgba(0, 0, 0, 0.4);
             padding: 0.2rem 0.4rem;
@@ -123,19 +127,23 @@
             -ms-overflow-style: none;
         }
 
-        /* History entries — one per answer, appended not overwritten */
-        .response-entry { margin-bottom: 1.25rem; }
+        /* History entries — one per answer, appended not overwritten.
+           Separation is intentionally still just spacing + a divider line
+           (no cards/shadows/rounded containers), just stronger than before
+           so consecutive answers read as clearly distinct at a glance. */
+        .response-entry { margin-bottom: 1.75rem; }
         .response-entry:last-child { margin-bottom: 0; }
         .entry-divider {
             display: flex;
             justify-content: space-between;
-            font-size: 0.7rem;
-            color: #9ca3af;
+            font-size: 0.72rem;
+            color: #b5bcc7;
+            font-weight: 600;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
-            margin-bottom: 0.5rem;
-            padding-bottom: 0.35rem;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            letter-spacing: 0.06em;
+            margin-bottom: 0.65rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid rgba(255, 255, 255, 0.14);
         }
 
         /* Explanation (left) + code (right), side by side, only when the
@@ -153,6 +161,41 @@
         }
         .entry-text { min-width: 0; }
         .entry-code { min-width: 0; }
+
+        /* "More details": a button under each finished answer, and the
+           expansion rendered as an indented row directly below its answer. */
+        .entry-footer {
+            margin-top: 0.5rem;
+        }
+        .more-details-btn {
+            background: rgba(255,255,255,0.06);
+            color: rgba(255,255,255,0.85);
+            border: 1px solid rgba(255,255,255,0.2);
+            padding: 3px 10px;
+            font-size: 11px;
+            border-radius: 4px;
+            cursor: pointer;
+            -webkit-app-region: no-drag;
+            transition: background 0.2s ease, border-color 0.2s ease;
+        }
+        .more-details-btn:hover:not(:disabled) {
+            background: rgba(255,255,255,0.14);
+            border-color: rgba(255,255,255,0.35);
+        }
+        .more-details-btn:disabled {
+            cursor: default;
+            opacity: 0.6;
+        }
+        .response-entry.expansion {
+            margin-top: -0.75rem;
+            margin-left: 0.6rem;
+            padding-left: 0.75rem;
+            border-left: 2px solid rgba(96, 165, 250, 0.55);
+        }
+        .response-entry.expansion .entry-divider {
+            color: #93c5fd;
+            border-bottom-width: 1px;
+        }
 
         /* Code block styling */
         .code-block {
@@ -375,6 +418,10 @@
             pointer-events: none;
             user-select: none;
             opacity: 0.9;
+            /* Explicit, not just inherited from .window-header — makes
+               dragging by the title text itself as reliable as dragging
+               elsewhere on the header bar. */
+            -webkit-app-region: drag;
         }
         .window-controls {
             display: flex;
@@ -484,12 +531,16 @@
         let responseScrollEl = null;
         let initialized = false;
 
-        // A response currently streaming in via transcription-llm-response
-        // -start/-chunk events. One variable (not a messageId-keyed map) is
-        // enough — this app never has more than one in-flight request per
-        // window (the fallback path on failure deliberately reuses the same
-        // messageId rather than starting a second stream).
-        let liveEntry = null;
+        // Responses currently streaming in via transcription-llm-response
+        // -start/-chunk events, keyed by messageId. A map (not one variable)
+        // because a "More details" expansion can stream while a new answer
+        // streams (the fallback path on failure reuses the same messageId).
+        const liveEntries = new Map();
+
+        // The most recently created response row (live or, for the
+        // non-streamed fallback path, final) — the target for the "New
+        // Response" button's scroll-to-start navigation.
+        let lastResponseRowEl = null;
 
         // How close to the bottom (px) counts as "already following along" —
         // within this, new content auto-scrolls into view; beyond it, the
@@ -567,6 +618,15 @@
                             handleStreamStart(data && typeof data === 'object' ? data : {});
                         } catch (err) {
                             console.error('[LLM-RESPONSE] Error handling stream start:', err);
+                        }
+                    });
+                }
+                if (typeof window.electronAPI.onMoreDetailsFailed === 'function') {
+                    window.electronAPI.onMoreDetailsFailed((event, data) => {
+                        try {
+                            handleMoreDetailsFailed(data && typeof data === 'object' ? data : {});
+                        } catch (err) {
+                            console.error('[LLM-RESPONSE] Error handling more-details failure:', err);
                         }
                     });
                 }
@@ -705,17 +765,12 @@
         }
 
         // Swap a live (streaming) entry's row for its fully-parsed final
-        // version in place, instead of appending a duplicate.
+        // version in place, instead of appending a duplicate. This is a
+        // continuation of the same in-flight answer, not a new event, so it
+        // deliberately never touches scroll position or the "new response"
+        // indicator (both are decided once, at handleStreamStart).
         function replaceEntryNode(oldNode, newNode) {
-            const scrollEl = getResponseScrollEl();
-            const stick = isNearBottom(scrollEl);
             oldNode.replaceWith(newNode);
-            if (stick) {
-                scrollToBottomInstant(scrollEl);
-                hideNewResponseIndicator();
-            } else {
-                showNewResponseIndicator();
-            }
         }
 
         // A live streamed entry — created on transcription-llm-response-start,
@@ -723,14 +778,16 @@
         // parse per chunk — too expensive to redo on every delta); it gets
         // replaced wholesale by the fully-parsed version once the final
         // display-llm-response event lands (see displayResponse).
-        function createLiveEntry(messageId, index) {
+        function createLiveEntry(messageId, index, parentMessageId) {
             const entry = document.createElement('div');
-            entry.className = 'response-entry';
+            entry.className = parentMessageId ? 'response-entry expansion' : 'response-entry';
             entry.dataset.responseIndex = String(index);
+            entry.dataset.messageId = messageId;
+            if (parentMessageId) entry.dataset.parentMessageId = parentMessageId;
 
             const divider = document.createElement('div');
             divider.className = 'entry-divider';
-            divider.innerHTML = `<span>#${index}</span><span>${new Date().toLocaleTimeString()}</span>`;
+            divider.innerHTML = `<span>${entryLabel(index, !!parentMessageId)}</span><span>${new Date().toLocaleTimeString()}</span>`;
             entry.appendChild(divider);
 
             const body = document.createElement('div');
@@ -741,7 +798,108 @@
             textEl.className = 'markdown-content entry-text';
             body.appendChild(textEl);
 
-            return { rowEl: entry, textBodyEl: textEl, messageId, index };
+            return { rowEl: entry, textBodyEl: textEl, messageId, parentMessageId: parentMessageId || null, index, pendingDelta: '', flushTimer: null };
+        }
+
+        function entryLabel(index, isExpansion) {
+            return isExpansion ? `#${index} · More details` : `#${index}`;
+        }
+
+        function findRowByMessageId(messageId) {
+            if (!messageId) return null;
+            const rows = document.querySelectorAll('#entries .response-entry');
+            for (const row of rows) {
+                if (row.dataset.messageId === messageId) return row;
+            }
+            return null;
+        }
+
+        // Expansion rows are inserted/grown/replaced mid-list, possibly ABOVE
+        // what the user is currently reading — which would otherwise push that
+        // content down the screen. Keep the first visible row at the same
+        // on-screen position across the DOM change (explicitly, not relying on
+        // browser scroll anchoring). `replaced` = [oldNode, newNode] when the
+        // anchor itself may be swapped out.
+        function withViewportPreserved(mutate, replaced) {
+            const sc = getResponseScrollEl();
+            if (!sc) { mutate(); return; }
+            const viewTop = sc.getBoundingClientRect().top;
+            let anchor = null;
+            for (const row of document.querySelectorAll('#entries .response-entry')) {
+                if (row.getBoundingClientRect().bottom > viewTop) { anchor = row; break; }
+            }
+            if (!anchor) { mutate(); return; }
+            const before = anchor.getBoundingClientRect().top;
+            mutate();
+            const target = replaced && anchor === replaced[0] ? replaced[1] : anchor;
+            if (!target || !target.isConnected) return;
+            const delta = target.getBoundingClientRect().top - before;
+            if (delta) sc.scrollTop += delta;
+        }
+
+        // Expansions go directly below their parent answer, never at the end
+        // of the list. Inserting mid-list must not move what the user is
+        // reading or raise the "New response" pill — the user asked for it
+        // while looking at that answer.
+        function insertExpansionRow(rowEl, parentMessageId) {
+            withViewportPreserved(() => {
+                const parentRow = findRowByMessageId(parentMessageId);
+                if (!parentRow) {
+                    document.getElementById('entries').appendChild(rowEl);
+                    return;
+                }
+                parentRow.after(rowEl);
+            });
+        }
+
+        function setMoreDetailsButtonState(parentMessageId, state) {
+            const parentRow = findRowByMessageId(parentMessageId);
+            const btn = parentRow && parentRow.querySelector('.more-details-btn');
+            if (!btn) return;
+            const states = {
+                loading: ['Loading more details…', true],
+                done: ['Details shown below ↓', true],
+                retry: ['Retry more details', false],
+                unavailable: ['Details unavailable', true]
+            };
+            const [label, disabled] = states[state] || ['More details', false];
+            btn.textContent = label;
+            btn.disabled = disabled;
+        }
+
+        // parentMessageId -> 'loading' | 'done'; blocks repeated clicks
+        // locally, on top of main's own duplicate check.
+        const moreDetailsState = new Map();
+
+        function requestMoreDetails(parentMessageId) {
+            if (!parentMessageId || moreDetailsState.has(parentMessageId)) return;
+            if (!window.electronAPI || typeof window.electronAPI.requestMoreDetails !== 'function') return;
+            moreDetailsState.set(parentMessageId, 'loading');
+            setMoreDetailsButtonState(parentMessageId, 'loading');
+            window.electronAPI.requestMoreDetails(parentMessageId).then((result) => {
+                if (result && result.ok) return;
+                if (result && result.reason === 'unavailable') {
+                    setMoreDetailsButtonState(parentMessageId, 'unavailable');
+                }
+                // 'duplicate': an expansion is already running/done — keep
+                // the button disabled in its current state.
+            }).catch((err) => {
+                console.error('[LLM-RESPONSE] More details request failed:', err);
+                moreDetailsState.delete(parentMessageId);
+                setMoreDetailsButtonState(parentMessageId, 'retry');
+            });
+        }
+
+        function handleMoreDetailsFailed(data) {
+            if (!data || !data.parentMessageId) return;
+            const live = data.messageId && liveEntries.get(data.messageId);
+            if (live) {
+                if (live.flushTimer) clearTimeout(live.flushTimer);
+                withViewportPreserved(() => live.rowEl.remove());
+                liveEntries.delete(data.messageId);
+            }
+            moreDetailsState.delete(data.parentMessageId);
+            setMoreDetailsButtonState(data.parentMessageId, 'retry');
         }
 
         function handleStreamStart(data) {
@@ -754,34 +912,79 @@
             const responseElement = document.getElementById('response-content');
             if (responseElement) responseElement.classList.remove('hidden');
 
+            if (data.parentMessageId) {
+                // "More details" expansion: indented row under its parent,
+                // numbered like the parent, no scroll / no pill.
+                const parentRow = findRowByMessageId(data.parentMessageId);
+                const parentIndex = parentRow ? Number(parentRow.dataset.responseIndex) || 0 : 0;
+                const live = createLiveEntry(data.messageId, parentIndex, data.parentMessageId);
+                liveEntries.set(data.messageId, live);
+                insertExpansionRow(live.rowEl, data.parentMessageId);
+                moreDetailsState.set(data.parentMessageId, 'loading');
+                setMoreDetailsButtonState(data.parentMessageId, 'loading');
+                return;
+            }
+
             responseIndex += 1;
             const live = createLiveEntry(data.messageId, responseIndex);
-            liveEntry = live;
-            appendEntryNode(live.rowEl);
-        }
+            liveEntries.set(data.messageId, live);
+            lastResponseRowEl = live.rowEl;
 
-        function handleStreamChunk(data) {
-            if (!liveEntry || !data || !data.messageId || data.messageId !== liveEntry.messageId) return;
-            if (!data.delta) return;
-
-            const scrollEl = getResponseScrollEl();
-            const stick = isNearBottom(scrollEl);
-            liveEntry.textBodyEl.textContent += data.delta;
-            if (stick) {
-                scrollToBottomInstant(scrollEl);
+            // A new question/answer must NOT move the viewport — the user
+            // may be mid-read on an older answer. It's appended into the
+            // history and, unless this is the very first response ever
+            // (nothing to navigate away from), the "New Response" pill lets
+            // the user jump to it on their own terms (see the click handler
+            // below, which scrolls to this row's start).
+            document.getElementById('entries').appendChild(live.rowEl);
+            if (isFirstResponseEver) {
+                isFirstResponseEver = false;
                 hideNewResponseIndicator();
             } else {
                 showNewResponseIndicator();
             }
         }
 
+        // Deltas are buffered and flushed to the DOM on a ~70ms interval
+        // rather than on every chunk, matching the target 50-100ms batching
+        // window — token-rate chunks would otherwise each force a DOM write
+        // plus a scroll-position recompute.
+        const STREAM_FLUSH_MS = 70;
+
+        function handleStreamChunk(data) {
+            if (!data || !data.messageId || !data.delta) return;
+            const entry = liveEntries.get(data.messageId);
+            if (!entry) return;
+
+            entry.pendingDelta += data.delta;
+            if (entry.flushTimer) return;
+
+            entry.flushTimer = setTimeout(() => {
+                entry.flushTimer = null;
+                if (!entry.pendingDelta) return;
+                // Deliberately no scroll here — the viewport must stay put
+                // while an answer streams in; the user scrolls themselves
+                // when they want to. An expansion row can sit above what the
+                // user is reading, so its growth is viewport-compensated.
+                const pending = entry.pendingDelta;
+                entry.pendingDelta = '';
+                if (entry.parentMessageId) {
+                    withViewportPreserved(() => { entry.textBodyEl.textContent += pending; });
+                } else {
+                    entry.textBodyEl.textContent += pending;
+                }
+            }, STREAM_FLUSH_MS);
+        }
+
         // Builds one complete, fully-parsed `.response-entry` row (text +,
         // when present, a code column) for a finished answer. Pure — does
-        // not touch the DOM outside the node it returns.
-        function buildEntryNode(response, index) {
+        // not touch the DOM outside the node it returns. `meta` carries the
+        // answer's messageId / parentMessageId / usedFallback.
+        function buildEntryNode(response, index, meta = {}) {
             const codeBlocks = extractCodeBlocks(response);
             const hasCodeLocal = codeBlocks.length > 0;
             hasCode = hasCodeLocal;
+            const isExpansion = !!meta.parentMessageId;
 
             let textContent = response;
             codeBlocks.forEach(block => {
@@ -791,12 +994,14 @@
             const textHtml = renderMarkdown(textContent);
 
             const entry = document.createElement('div');
-            entry.className = 'response-entry';
+            entry.className = isExpansion ? 'response-entry expansion' : 'response-entry';
             entry.dataset.responseIndex = String(index);
+            if (meta.messageId) entry.dataset.messageId = meta.messageId;
+            if (isExpansion) entry.dataset.parentMessageId = meta.parentMessageId;
 
             const divider = document.createElement('div');
             divider.className = 'entry-divider';
-            divider.innerHTML = `<span>#${index}</span><span>${new Date().toLocaleTimeString()}</span>`;
+            divider.innerHTML = `<span>${entryLabel(index, isExpansion)}</span><span>${new Date().toLocaleTimeString()}</span>`;
             entry.appendChild(divider);
 
             const body = document.createElement('div');
@@ -844,6 +1049,23 @@
                 }
             }
 
+            // "More details" — only on a real finished answer (not on a
+            // fallback "could you repeat" reply, and not on an expansion).
+            if (meta.messageId && !meta.usedFallback && !isExpansion) {
+                const footer = document.createElement('div');
+                footer.className = 'entry-footer';
+                const btn = document.createElement('button');
+                btn.className = 'more-details-btn';
+                btn.type = 'button';
+                btn.textContent = 'More details';
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    requestMoreDetails(meta.messageId);
+                });
+                footer.appendChild(btn);
+                entry.appendChild(footer);
+            }
+
             return entry;
         }
 
@@ -867,15 +1089,40 @@
                 return;
             }
 
-            const incomingMessageId = data.metadata && data.metadata.messageId;
+            const meta = data.metadata || {};
+            const incomingMessageId = meta.messageId;
+            const live = incomingMessageId ? liveEntries.get(incomingMessageId) : null;
 
-            // If this is the final payload for the entry currently streaming
+            // If this is the final payload for an entry currently streaming
             // in, replace that live row in place with the fully-parsed
             // version instead of appending a duplicate.
-            if (liveEntry && incomingMessageId && incomingMessageId === liveEntry.messageId) {
-                const finalNode = buildEntryNode(response, liveEntry.index);
-                replaceEntryNode(liveEntry.rowEl, finalNode);
-                liveEntry = null;
+            if (live) {
+                if (live.flushTimer) {
+                    clearTimeout(live.flushTimer);
+                    live.flushTimer = null;
+                }
+                const finalNode = buildEntryNode(response, live.index, meta);
+                if (live.parentMessageId) {
+                    withViewportPreserved(() => replaceEntryNode(live.rowEl, finalNode), [live.rowEl, finalNode]);
+                } else {
+                    replaceEntryNode(live.rowEl, finalNode);
+                }
+                liveEntries.delete(incomingMessageId);
+                if (meta.parentMessageId) {
+                    moreDetailsState.set(meta.parentMessageId, 'done');
+                    setMoreDetailsButtonState(meta.parentMessageId, 'done');
+                }
+                return;
+            }
+
+            if (meta.parentMessageId) {
+                // Expansion that arrived without a live row (non-streamed):
+                // still goes under its parent, no scroll.
+                const parentRow = findRowByMessageId(meta.parentMessageId);
+                const parentIndex = parentRow ? Number(parentRow.dataset.responseIndex) || 0 : 0;
+                insertExpansionRow(buildEntryNode(response, parentIndex, meta), meta.parentMessageId);
+                moreDetailsState.set(meta.parentMessageId, 'done');
+                setMoreDetailsButtonState(meta.parentMessageId, 'done');
                 return;
             }
 
@@ -883,9 +1130,9 @@
             // missing/mismatched) — append fresh, same as before streaming
             // existed. Safe fallback so nothing regresses if some call site
             // doesn't carry a messageId.
-            liveEntry = null;
             responseIndex += 1;
-            const node = buildEntryNode(response, responseIndex);
+            const node = buildEntryNode(response, responseIndex, meta);
+            lastResponseRowEl = node;
             appendEntryNode(node);
         }
 
@@ -1001,12 +1248,17 @@
             console.log('LLM Response window closing');
         });
 
-        // New-response indicator: click to jump to the latest content.
+        // New-response indicator: click to smooth-scroll to the START of
+        // the newest response (not the bottom of the container, and not
+        // the bottom of that response) so its first line is what comes
+        // into view.
         (function() {
             const el = document.getElementById('new-response-indicator');
             if (!el) return;
             el.addEventListener('click', () => {
-                scrollToBottomInstant(getResponseScrollEl());
+                if (lastResponseRowEl) {
+                    lastResponseRowEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
                 hideNewResponseIndicator();
             });
         })();

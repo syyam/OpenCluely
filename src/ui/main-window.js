@@ -171,7 +171,13 @@ class MainWindowUI {
             
             // Update button state
             this.micButton.disabled = !this.isInteractive;
-            
+
+            if (this.myMicButton) {
+                this.myMicButton.classList.remove('interactive', 'non-interactive');
+                this.myMicButton.classList.add(this.isInteractive ? 'interactive' : 'non-interactive');
+                this.myMicButton.disabled = !this.isInteractive;
+            }
+
             logger.debug('Mic button state updated', {
                 component: 'MainWindowUI',
                 interactive: this.isInteractive,
@@ -232,6 +238,7 @@ class MainWindowUI {
         this.statusDot = document.getElementById('statusDot');
         this.settingsIndicator = document.getElementById('settingsIndicator'); // Optional
         this.micButton = document.getElementById('micButton');
+        this.myMicButton = document.getElementById('myMicButton');
     this.infoButton = document.getElementById('infoButton');
     this.shortcutsPopover = document.getElementById('shortcutsPopover');
     this.closeAppButton = document.getElementById('closeAppButton');
@@ -291,7 +298,7 @@ class MainWindowUI {
         if (this.settingsIndicator) {
             this.settingsIndicator.addEventListener('click', () => {
                 if (this.isInteractive) {
-                    this.showSettingsMenu();
+                    this.openSettings();
                 }
             });
         }
@@ -320,6 +327,35 @@ class MainWindowUI {
                 this.loadSpeechAvailability();
             }
         });
+
+        // "My Microphone" - independent of the Meeting Audio mic button above.
+        // Off by default; toggling it never starts/stops Meeting Audio and
+        // vice versa (see speech.service.js's separate mic-channel state).
+        this.myMicListening = false;
+        if (this.myMicButton) {
+            this.myMicButton.addEventListener('click', async () => {
+                if (!this.isInteractive) return;
+                try {
+                    if (this.myMicListening) {
+                        await window.electronAPI.stopMicCapture();
+                        this._stopMyMicCapture();
+                        this.myMicListening = false;
+                    } else {
+                        await window.electronAPI.startMicCapture();
+                        await this._startMyMicCapture();
+                        this.myMicListening = true;
+                    }
+                    this.myMicButton.classList.toggle('mic-listening', this.myMicListening);
+                } catch (error) {
+                    logger.error('My Microphone toggle failed', {
+                        component: 'MainWindowUI',
+                        error: error.message
+                    });
+                    this.myMicListening = false;
+                    this.myMicButton.classList.remove('mic-listening');
+                }
+            });
+        }
 
         // Language dropdown
         this.languageSelect = document.getElementById('codingLanguage');
@@ -582,12 +618,15 @@ class MainWindowUI {
         if (this.micButton) {
             this.micButton.classList.add('recording');
         }
-        // On Windows and macOS, Whisper audio is captured here in the renderer
-        // (Web Audio API) rather than the main process: Windows lacks sox/rec/
-        // arecord, and macOS avoids an unbundled Homebrew `sox`. Must match the
-        // main process's useRendererCapture gate (speech.service.js). Linux uses
-        // the native recorder. navigator.userAgentData is preferred when present
-        // since navigator.platform is deprecated.
+        // On Windows and macOS, Meeting Audio (desktop/system-audio loopback)
+        // is captured here in the renderer (Web Audio API) rather than the
+        // main process: Windows lacks sox/rec/arecord, and macOS avoids an
+        // unbundled Homebrew `sox`. Must match the main process's
+        // useRendererCapture gate (speech.service.js). Linux still uses the
+        // native recorder (physical mic, not loopback - see
+        // _startMicrophoneCaptureWithFallback in speech.service.js).
+        // navigator.userAgentData is preferred when present since
+        // navigator.platform is deprecated.
         const platform = (typeof navigator !== 'undefined' &&
           ((navigator.userAgentData && navigator.userAgentData.platform) ||
             navigator.platform || '')).toLowerCase();
@@ -608,22 +647,44 @@ class MainWindowUI {
     }
 
     /**
-     * Capture microphone audio in the renderer using the Web Audio API.
-     * This is used for Whisper on Windows where node-record-lpcm16's sox/rec
-     * dependencies are unavailable.
+     * Capture "Meeting Audio" - the system/desktop output (Zoom, other call
+     * audio) via loopback, NOT the physical microphone. This is independent
+     * of headphones vs. speakers: it captures what's actually playing
+     * through the system, not what a physical mic happens to pick up. See
+     * _startMyMicCapture below for the separate, off-by-default physical-mic
+     * channel used to address the assistant directly.
      */
     async _startRendererAudioCapture() {
         try {
             this._stopRendererAudioCapture();
 
+            const sourceId = await window.electronAPI.getDesktopAudioSourceId();
+            if (!sourceId) {
+                throw new Error('No desktop audio source available for Meeting Audio capture');
+            }
+
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                    sampleRate: { ideal: 16000 }
+                    mandatory: {
+                        chromeMediaSource: 'desktop',
+                        chromeMediaSourceId: sourceId
+                    }
+                },
+                video: {
+                    mandatory: {
+                        chromeMediaSource: 'desktop',
+                        chromeMediaSourceId: sourceId,
+                        minWidth: 1,
+                        maxWidth: 1,
+                        minHeight: 1,
+                        maxHeight: 1
+                    }
                 }
             });
+            // Desktop-capture requires requesting a video track alongside the
+            // audio track (a known Chromium constraint) - discard it immediately,
+            // only the audio matters here.
+            stream.getVideoTracks().forEach((track) => track.stop());
             this._mediaStream = stream;
 
             const audioContext = new (window.AudioContext || window.webkitAudioContext)({
@@ -652,9 +713,9 @@ class MainWindowUI {
             source.connect(scriptNode);
             scriptNode.connect(audioContext.destination);
 
-            logger.info('Renderer audio capture started', { component: 'MainWindowUI' });
+            logger.info('Meeting Audio capture started', { component: 'MainWindowUI' });
         } catch (error) {
-            logger.error('Failed to start renderer audio capture', {
+            logger.error('Failed to start Meeting Audio capture', {
                 component: 'MainWindowUI',
                 error: error.message
             });
@@ -685,7 +746,87 @@ class MainWindowUI {
                 this._captureInterval = null;
             }
         } catch (error) {
-            logger.error('Error stopping renderer audio capture', {
+            logger.error('Error stopping Meeting Audio capture', {
+                component: 'MainWindowUI',
+                error: error.message
+            });
+        }
+    }
+
+    /**
+     * "My Microphone" - the user's actual physical mic, captured completely
+     * independently of Meeting Audio above (separate MediaStream/AudioContext/
+     * ScriptProcessorNode, separate IPC channel to speech.service.js's mic-
+     * channel state). Off by default; only runs while the user has this
+     * toggled on in the main bar.
+     */
+    async _startMyMicCapture() {
+        try {
+            this._stopMyMicCapture();
+
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                    sampleRate: { ideal: 16000 }
+                }
+            });
+            this._myMicStream = stream;
+
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                sampleRate: 16000
+            });
+            this._myMicAudioContext = audioContext;
+
+            const source = audioContext.createMediaStreamSource(stream);
+            const bufferSize = 4096;
+            const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
+            this._myMicScriptNode = scriptNode;
+
+            scriptNode.onaudioprocess = (event) => {
+                if (!this.myMicListening || !window.electronAPI || !window.electronAPI.sendMicAudioChunk) {
+                    return;
+                }
+                const inputData = event.inputBuffer.getChannelData(0);
+                const pcm16 = new Int16Array(inputData.length);
+                for (let i = 0; i < inputData.length; i++) {
+                    const s = Math.max(-1, Math.min(1, inputData[i]));
+                    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                window.electronAPI.sendMicAudioChunk(pcm16.buffer);
+            };
+
+            source.connect(scriptNode);
+            scriptNode.connect(audioContext.destination);
+
+            logger.info('My Microphone capture started', { component: 'MainWindowUI' });
+        } catch (error) {
+            logger.error('Failed to start My Microphone capture', {
+                component: 'MainWindowUI',
+                error: error.message
+            });
+            throw error;
+        }
+    }
+
+    _stopMyMicCapture() {
+        try {
+            if (this._myMicScriptNode) {
+                this._myMicScriptNode.disconnect();
+                this._myMicScriptNode.onaudioprocess = null;
+                this._myMicScriptNode = null;
+            }
+            if (this._myMicStream) {
+                this._myMicStream.getTracks().forEach((track) => track.stop());
+                this._myMicStream = null;
+            }
+            if (this._myMicAudioContext) {
+                this._myMicAudioContext.close().catch(() => {});
+                this._myMicAudioContext = null;
+            }
+        } catch (error) {
+            logger.error('Error stopping My Microphone capture', {
                 component: 'MainWindowUI',
                 error: error.message
             });
@@ -920,82 +1061,6 @@ class MainWindowUI {
             });
             this.showNotification('Failed to open settings', 'error');
         }
-    }
-
-    showSettingsMenu() {
-        const menu = document.createElement('div');
-        menu.className = 'settings-menu';
-        menu.style.cssText = `
-            position: absolute;
-            right: 10px;
-            top: 35px;
-            background: rgba(0, 0, 0, 0.8);
-            backdrop-filter: blur(20px);
-            border-radius: 8px;
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            padding: 8px 0;
-            min-width: 150px;
-            z-index: 1000;
-        `;
-
-        const settingsOption = this.createMenuItem('Settings', 'fa-cog', () => {
-            this.openSettings();
-            document.body.removeChild(menu);
-        });
-
-        const quitOption = this.createMenuItem('Quit OpenCluely', 'fa-power-off', () => {
-            if (window.electronAPI && window.electronAPI.quit) {
-                window.electronAPI.quit();
-            }
-        });
-
-        menu.appendChild(settingsOption);
-        menu.appendChild(this.createMenuSeparator());
-        menu.appendChild(quitOption);
-
-        // Add click outside listener to close menu
-        const closeMenu = (e) => {
-            if (!menu.contains(e.target) && !this.settingsIndicator.contains(e.target)) {
-                document.body.removeChild(menu);
-                document.removeEventListener('click', closeMenu);
-            }
-        };
-        document.addEventListener('click', closeMenu);
-
-        document.body.appendChild(menu);
-    }
-
-    createMenuItem(text, iconClass, onClick) {
-        const item = document.createElement('div');
-        item.style.cssText = `
-            padding: 8px 16px;
-            color: rgba(255, 255, 255, 0.9);
-            font-size: 13px;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            transition: all 0.2s ease;
-        `;
-        item.innerHTML = `<i class="fas ${iconClass}"></i>${text}`;
-        item.addEventListener('mouseover', () => {
-            item.style.background = 'rgba(255, 255, 255, 0.1)';
-        });
-        item.addEventListener('mouseout', () => {
-            item.style.background = 'transparent';
-        });
-        item.addEventListener('click', onClick);
-        return item;
-    }
-
-    createMenuSeparator() {
-        const separator = document.createElement('div');
-        separator.style.cssText = `
-            height: 1px;
-            background: rgba(255, 255, 255, 0.1);
-            margin: 8px 0;
-        `;
-        return separator;
     }
 
     toggleShortcutsPopover() {

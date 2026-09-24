@@ -11,6 +11,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stopSpeechRecognition: () => ipcRenderer.invoke('stop-speech-recognition'),
   sendAudioChunk: (buffer) => ipcRenderer.send('audio-chunk', { buffer }),
   getSpeechAvailability: () => ipcRenderer.invoke('get-speech-availability'),
+  getDesktopAudioSourceId: () => ipcRenderer.invoke('get-desktop-audio-source-id'),
+
+  // "My Microphone" - separate, off-by-default direct-to-assistant input
+  startMicCapture: () => ipcRenderer.invoke('start-mic-capture'),
+  stopMicCapture: () => ipcRenderer.invoke('stop-mic-capture'),
+  sendMicAudioChunk: (buffer) => ipcRenderer.send('mic-audio-chunk', { buffer }),
   
   // Window management
   showAllWindows: () => ipcRenderer.invoke('show-all-windows'),
@@ -111,6 +117,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onTranscriptionLlmResponse: (callback) => ipcRenderer.on('transcription-llm-response', callback),
   onTranscriptionLlmResponseStart: (callback) => ipcRenderer.on('transcription-llm-response-start', callback),
   onTranscriptionLlmResponseChunk: (callback) => ipcRenderer.on('transcription-llm-response-chunk', callback),
+  // "More details" (AI Response overlay only)
+  requestMoreDetails: (messageId) => ipcRenderer.invoke('request-more-details', messageId),
+  onMoreDetailsFailed: (callback) => ipcRenderer.on('more-details-failed', callback),
   onOpenGeminiConfig: (callback) => ipcRenderer.on('open-gemini-config', callback),
   onDisplayLlmResponse: (callback) => ipcRenderer.on('display-llm-response', callback),
   onShowLoading: (callback) => ipcRenderer.on('show-loading', callback),

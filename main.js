@@ -1,7 +1,7 @@
 const path = require("path");
 const fs = require("fs");
 const { fileURLToPath } = require("url");
-const { app, BrowserWindow, globalShortcut, session, ipcMain, dialog } = require("electron");
+const { app, BrowserWindow, globalShortcut, session, ipcMain, dialog, desktopCapturer } = require("electron");
 const candidateContext = require("./src/core/candidate-context");
 const interviewMetadata = require("./src/core/interview-metadata");
 const responseLanguage = require("./src/core/response-language");
@@ -110,6 +110,7 @@ const llmService = require("./src/services/llm.service");
 // Managers
 const windowManager = require("./src/managers/window.manager");
 const sessionManager = require("./src/managers/session.manager");
+const { promptLoader } = require("./prompt-loader");
 
 class ApplicationController {
   constructor() {
@@ -133,6 +134,12 @@ class ApplicationController {
     this._utteranceTimer = null;
     this._utteranceDispatchInFlight = false;
     this._utteranceCoalesceMs = 800;
+
+    // "More details": finished answers that can be expanded on demand, keyed
+    // by their UI messageId (see rememberResponse/requestMoreDetails).
+    this._responseRecords = new Map();
+    this._maxResponseRecords = 30;
+    this._expansionsRequested = new Set();
 
     // First-run onboarding: detects missing .env / API key and triggers
     // a settings-window prompt on first launch so users don't have to
@@ -362,13 +369,18 @@ class ApplicationController {
 
     // Electron exposes camera/microphone access as the single `media`
     // permission. The requested device type is provided separately in details.
+    // "video" is allowed here too, but ONLY for trusted app content (never a
+    // real webcam feed anywhere in this app) - it's needed for Meeting
+    // Audio's desktop-loopback capture, which Chromium requires a (discarded)
+    // video track alongside the audio track to obtain (see
+    // _startRendererAudioCapture in main-window.js).
     appSession.setPermissionCheckHandler(
       (webContents, permission, _requestingOrigin, details = {}) => {
         if (!isTrustedAppContents(webContents)) {
           return false;
         }
         if (permission === "media") {
-          return !details.mediaType || details.mediaType === "audio";
+          return !details.mediaType || details.mediaType === "audio" || details.mediaType === "video";
         }
         return permission === "display-capture";
       }
@@ -433,7 +445,8 @@ class ApplicationController {
       windowManager.handleRecordingStopped();
     });
 
-    speechService.on("transcription", (text) => {
+    speechService.on("transcription", (text, meta) => {
+      logger.debug("Transcription received", { source: meta && meta.source ? meta.source : "meeting" });
       this.handleTranscriptionFragment(text);
     });
 
@@ -492,6 +505,35 @@ class ApplicationController {
     ipcMain.handle("stop-speech-recognition", () => {
       speechService.stopRecording();
       return speechService.getStatus();
+    });
+
+    // Desktop-audio-loopback source for "Meeting Audio" capture — resolved in
+    // the main process since desktopCapturer isn't available to a
+    // contextIsolated renderer. Used with chromeMediaSource:'desktop' so the
+    // meeting/system audio itself is captured regardless of headphones vs
+    // speakers, independent of whatever the user's own microphone hears.
+    ipcMain.handle("get-desktop-audio-source-id", async () => {
+      const sources = await desktopCapturer.getSources({ types: ["screen"] });
+      return sources.length ? sources[0].id : null;
+    });
+
+    // "My Microphone" — a separate, off-by-default input for the user to
+    // address the assistant directly, fully independent of Meeting Audio
+    // capture/state (see speech.service.js's mic-channel methods).
+    ipcMain.handle("start-mic-capture", () => {
+      speechService.startMicListening();
+      return true;
+    });
+
+    ipcMain.handle("stop-mic-capture", () => {
+      speechService.stopMicListening();
+      return true;
+    });
+
+    ipcMain.on("mic-audio-chunk", (_event, data) => {
+      if (data && data.buffer) {
+        speechService.handleMicAudioChunkFromRenderer(Buffer.from(data.buffer));
+      }
     });
 
     // Raw PCM audio captured by the renderer's Web Audio API (Windows Whisper path)
@@ -626,9 +668,8 @@ class ApplicationController {
     });
 
     ipcMain.handle("send-chat-message", async (event, text) => {
-      // Add chat message to session memory
-      sessionManager.addUserInput(text, 'chat');
-      logger.debug('Chat message added to session memory', { textLength: text.length });
+      // Not added to session memory here — processWithLLM records it once,
+      // paired with its answer, after the request completes.
 
       // Typed messages need the full skill pipeline (with history context),
       // NOT the voice "intelligent filter" pipeline. Voice keeps its filter
@@ -649,9 +690,12 @@ class ApplicationController {
       return { success: true };
     });
 
+    ipcMain.handle("request-more-details", (event, messageId) => {
+      return this.requestMoreDetails(messageId);
+    });
+
     ipcMain.handle("get-skill-prompt", (event, skillName) => {
       try {
-        const { promptLoader } = require('./prompt-loader');
         const skillPrompt = promptLoader.getSkillPrompt(skillName);
         return skillPrompt;
       } catch (error) {
@@ -1087,8 +1131,7 @@ class ApplicationController {
       // Use image directly with LLM and active skill; do not send chat messages here
       const sessionHistory = sessionManager.getOptimizedHistory();
 
-      const skillsRequiringProgrammingLanguage = ['android', 'frontend', 'fullstack'];
-      const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
+      const needsProgrammingLanguage = promptLoader.requiresProgrammingLanguage(this.activeSkill);
 
       this._responseSeq = (this._responseSeq || 0) + 1;
       const messageId = `img-${Date.now()}-${this._responseSeq}`;
@@ -1117,6 +1160,13 @@ class ApplicationController {
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
         isImageAnalysis: true
+      });
+      this.rememberResponse(messageId, llmResult, {
+        kind: 'image',
+        question: '',
+        programmingLanguage: needsProgrammingLanguage ? this.codingLanguage : null,
+        imageBuffer: capture.imageBuffer,
+        mimeType: capture.mimeType || 'image/png'
       });
 
       this.broadcastTranscriptionLLMResponse(llmResult);
@@ -1150,12 +1200,10 @@ class ApplicationController {
 
   async processWithLLM(text, sessionHistory) {
     try {
-      // Add user input to session memory
-      sessionManager.addUserInput(text, 'llm_input');
-
-      // Check if current skill needs programming language context
-      const skillsRequiringProgrammingLanguage = ['android', 'frontend', 'fullstack'];
-      const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
+      // The question is deliberately NOT in session memory yet: the request
+      // builder reads history and appends the current question itself, so
+      // it's recorded below together with its answer.
+      const needsProgrammingLanguage = promptLoader.requiresProgrammingLanguage(this.activeSkill);
 
       this._responseSeq = (this._responseSeq || 0) + 1;
       const messageId = `chat-${Date.now()}-${this._responseSeq}`;
@@ -1187,11 +1235,17 @@ class ApplicationController {
         responsePreview: llmResult.response.substring(0, 200) + "...",
       });
 
-      // Add LLM response to session memory
+      // Record the question/answer pair once, now that the request is done.
+      sessionManager.addUserInput(text, 'chat');
       sessionManager.addModelResponse(llmResult.response, {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
+      });
+      this.rememberResponse(messageId, llmResult, {
+        kind: 'chat',
+        question: text,
+        programmingLanguage: needsProgrammingLanguage ? this.codingLanguage : null
       });
 
       this.broadcastTranscriptionLLMResponse(llmResult);
@@ -1236,7 +1290,8 @@ class ApplicationController {
     }
 
     // Route speech UI events according to the user's response-target setting.
-    sessionManager.addUserInput(fragment, 'speech');
+    // Fragments are not written to session memory — the coalesced question
+    // is recorded once, with its answer, in processTranscriptionWithLLM.
     this.sendToVoiceResponseWindows("transcription-received", { text: fragment });
 
     this._utteranceBuffer = this._utteranceBuffer
@@ -1323,9 +1378,7 @@ class ApplicationController {
         textPreview: cleanText.substring(0, 100) + "..."
       });
 
-      // Check if current skill needs programming language context
-      const skillsRequiringProgrammingLanguage = ['android', 'frontend', 'fullstack'];
-      const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
+      const needsProgrammingLanguage = promptLoader.requiresProgrammingLanguage(this.activeSkill);
 
       // Stream the answer progressively to the configured speech target.
       // A unique messageId ties the start/chunk/final events to one bubble so
@@ -1353,12 +1406,19 @@ class ApplicationController {
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
 
-      // Add LLM response to session memory
+      // Record the question/answer pair once, now that the request is done
+      // (the question was not in history while the request was built).
+      sessionManager.addUserInput(cleanText, 'speech');
       sessionManager.addModelResponse(llmResult.response, {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
         isTranscriptionResponse: true
+      });
+      this.rememberResponse(messageId, llmResult, {
+        kind: 'voice',
+        question: cleanText,
+        programmingLanguage: needsProgrammingLanguage ? this.codingLanguage : null
       });
 
       this.sendTranscriptionLLMResponseToVoiceTargets(llmResult);
@@ -1396,6 +1456,7 @@ class ApplicationController {
           fallbackResult.metadata = { ...fallbackResult.metadata, messageId };
         }
 
+        sessionManager.addUserInput(String(text || '').trim(), 'speech');
         sessionManager.addModelResponse(fallbackResult.response, {
           skill: this.activeSkill,
           processingTime: fallbackResult.metadata.processingTime,
@@ -1535,6 +1596,90 @@ class ApplicationController {
     this.sendToVoiceResponseWindows("transcription-llm-response", data);
   }
 
+  /** Send to the AI Response overlay only (More details lives only there). */
+  sendToOverlay(channel, data) {
+    const responseWindow = windowManager.getWindow("llmResponse");
+    if (responseWindow && !responseWindow.isDestroyed()) {
+      responseWindow.webContents.send(channel, data);
+    }
+  }
+
+  /**
+   * Keep what's needed to expand a finished answer later. Only real answers
+   * are kept — a fallback ("could you repeat…") reply can't be expanded. The
+   * profile/language that produced the answer are stored with it so an
+   * expansion never mixes profiles after a profile switch.
+   */
+  rememberResponse(messageId, llmResult, details) {
+    if (!messageId || !llmResult || !llmResult.response || (llmResult.metadata && llmResult.metadata.usedFallback)) {
+      return;
+    }
+    this._responseRecords.set(messageId, {
+      ...details,
+      answer: llmResult.response,
+      skill: this.activeSkill
+    });
+    while (this._responseRecords.size > this._maxResponseRecords) {
+      const oldest = this._responseRecords.keys().next().value;
+      this._responseRecords.delete(oldest);
+      this._expansionsRequested.delete(oldest);
+    }
+  }
+
+  /**
+   * User clicked "More details" on an answer in the overlay. Returns right
+   * away ({ok} / {ok:false, reason}); the expansion streams to the overlay
+   * under the parent answer. Never touches conversation history.
+   */
+  requestMoreDetails(parentMessageId) {
+    const record = this._responseRecords.get(parentMessageId);
+    if (!record) {
+      return { ok: false, reason: 'unavailable' };
+    }
+    if (this._expansionsRequested.has(parentMessageId)) {
+      return { ok: false, reason: 'duplicate' };
+    }
+    this._expansionsRequested.add(parentMessageId);
+
+    this._responseSeq = (this._responseSeq || 0) + 1;
+    const messageId = `exp-${Date.now()}-${this._responseSeq}`;
+
+    (async () => {
+      this.sendToOverlay("transcription-llm-response-start", {
+        messageId,
+        parentMessageId,
+        isExpansion: true,
+        skill: record.skill
+      });
+      try {
+        const llmResult = await llmService.processExpansionStream(record, (delta) => {
+          this.sendToOverlay("transcription-llm-response-chunk", { messageId, delta });
+        });
+        windowManager.showLLMResponse(llmResult.response, {
+          skill: record.skill,
+          processingTime: llmResult.metadata.processingTime,
+          usedFallback: false,
+          isExpansion: true,
+          messageId,
+          parentMessageId
+        });
+        logger.info("More details response completed", {
+          parentMessageId,
+          originalLength: record.answer.length,
+          responseLength: llmResult.response.length,
+          processingTime: llmResult.metadata.processingTime
+        });
+      } catch (error) {
+        logger.error("More details request failed", { parentMessageId, error: error.message });
+        // Allow a retry from the same button.
+        this._expansionsRequested.delete(parentMessageId);
+        this.sendToOverlay("more-details-failed", { parentMessageId, messageId, error: error.message });
+      }
+    })();
+
+    return { ok: true, messageId };
+  }
+
   onWindowAllClosed() {
     if (process.platform !== "darwin") {
       app.quit();
@@ -1650,6 +1795,7 @@ class ApplicationController {
       // save (switching profile while editing) lands on the right file.
       if (settings.resumeProfile && Object.prototype.hasOwnProperty.call(candidateContext.PROFILES, settings.resumeProfile)) {
         this.activeSkill = settings.resumeProfile;
+        sessionManager.setActiveSkill(settings.resumeProfile);
       }
       // Resume/background text — stored in its own file per profile, not
       // .env (see candidate-context.js: .env values get newline-collapsed

@@ -19,7 +19,7 @@
         height: 28px;
         background: linear-gradient(
           135deg,
-          rgba(0, 0, 0, 0.4) 0%,
+          rgba(0, 0, 0, 0.445) 0%,
           rgba(20, 20, 20, 0.5) 100%
         );
         backdrop-filter: blur(20px);
@@ -73,6 +73,15 @@
       .command-item.recording i {
         color: #ff4757;
         text-shadow: 0 0 10px rgba(255, 71, 87, 0.5);
+        animation: pulse 2s infinite;
+      }
+
+      /* "My Microphone" is off by default - green (not red) so it never
+         reads as an alarm state, and is visually distinct from Meeting
+         Audio's red recording indicator so the two are never confused. */
+      .command-item.mic-listening i {
+        color: #4caf50;
+        text-shadow: 0 0 10px rgba(76, 175, 80, 0.5);
         animation: pulse 2s infinite;
       }
 
@@ -388,8 +397,12 @@
         <span>⌘⇧S</span>
       </div>
       <div class="command-separator"></div>
-      <div class="command-item" id="micButton">
+      <div class="command-item" id="micButton" title="Meeting Audio (Zoom/system sound)">
         <i class="fas fa-microphone"></i>
+      </div>
+      <div class="command-separator"></div>
+      <div class="command-item" id="myMicButton" title="My Microphone (off by default - talk to the assistant directly)">
+        <i class="fas fa-headset"></i>
       </div>
       <div class="command-separator"></div>
       <div class="command-item" id="languageSelector">
@@ -404,6 +417,10 @@
       <div class="command-separator"></div>
       <div class="command-item" id="japaneseModeButton" title="Japanese (romaji) response mode">
         <i>JP</i>
+      </div>
+      <div class="command-separator"></div>
+      <div class="command-item" id="settingsIndicator" title="Settings (resume profile, response language, API key)">
+        <i class="fas fa-cog"></i>
       </div>
       <div class="command-separator"></div>
       <div class="command-item" id="infoButton" title="Shortcuts">

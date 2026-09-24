@@ -2,9 +2,53 @@ const { GoogleGenAI } = require('@google/genai');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
-const { getCandidateContextBlock, isPersonalContextRelevant } = require('../core/candidate-context');
-const { getInterviewMetadataBlock } = require('../core/interview-metadata');
 const responseLanguage = require('../core/response-language');
+
+// Appended (last) to the active profile prompt (prompts/<profile>.md) for
+// voice requests only. The profile prompt stays authoritative for content
+// and style; this covers what's specific to live-transcript input — most
+// importantly that spoken questions are answered in words, not code.
+const VOICE_TRANSCRIPT_NOTE = `
+
+## Live Transcript Input (overrides the sections above for this message)
+The user turn is a live speech-to-text transcript of what the interviewer just said. It may be fragmentary, run two sentences together, or contain misheard words — infer the intended question from the wording and the conversation so far, and answer that.
+- DEFAULT FOR SPOKEN QUESTIONS: a verbal, skimmable answer with NO code blocks. This applies to "what is X", "how does X work", "why X", "how would you handle/approach/design X", "how did you do/handle/solve X", "tell me about X" and experience/project questions — explain in words; if a class, function, or library name helps, put it inline as a short code-highlighted span, never a fenced code block.
+- Only include a code block when the interviewer explicitly asks you to write, code, implement, or show code, reads out a concrete coding/algorithm problem to solve (e.g. "write a function that reverses a linked list"), or asks you to fix/modify specific code. Then use the coding format above.
+- For an explicit system-design question ("design X"), a short text flow diagram is fine — that is not code.
+- Pure social small talk with no technical content (e.g. a bare "hello", "how are you", "can you hear me") gets a brief, natural one-line reply, then stop.
+- Anything with technical content or an actual question in it gets a real answer — never dismiss it as "not relevant."
+- Do not repeat the question back.`;
+
+// Appended to the active profile prompt ONLY for a user-triggered "More
+// details" request (see processExpansionStream). The normal answer path never
+// uses it.
+const EXPANSION_NOTE = `
+
+## More Details Request (overrides the answer formats above for this message)
+The conversation contains the original interview question and the concise answer already given. The candidate asked for more details. Expand the existing answer with the most useful additional depth for the original interview question.
+- Start directly with the content — no preamble such as "To elaborate…" or "Here is more detail…".
+- Preserve the original answer's meaning and correctness. Do not repeat what it already covers beyond a one-line anchor — add what's missing.
+- Prioritize the details an interviewer would care about most if they said "can you elaborate?".
+- Keep it concise, structured, and easy to scan (short headers/bullets). Add depth, not filler. Moderately longer than the original answer, not dramatically — never a textbook, tutorial, or long essay.
+- Adapt the depth to the topic:
+  - Technical theory: deeper reasoning, important internals, practical implications, key trade-offs, common pitfalls.
+  - Android/Kotlin: relevant internals, lifecycle/concurrency implications, practical production considerations, important edge cases.
+  - Coding/DSA: deeper reasoning, why the solution works, important edge cases, optimization trade-offs, complexity details.
+  - System design: ALWAYS include a design diagram in easily readable text form (boxes and arrows, e.g. [Client] --> [API] --> [DB]) — if the original answer already had one, give a more detailed version rather than omitting it. Then deeper design reasoning, important trade-offs, scaling considerations, reliability/failure cases, and the relevant data flow.
+  - Behavioral/personal: expand ONLY with information actually present in the Candidate Background / Personal & Interview Notes above. Never invent companies, projects, responsibilities, achievements, opinions, or experiences — if nothing more is available, add depth on reasoning/approach instead of new facts.
+- Include code only when it materially helps — typically when the original question was a coding problem or explicitly asked for code; otherwise explain in words.
+- The original question may be a live speech-to-text transcript (possibly misheard) — interpret it the same way the original answer did.`;
+
+// Per-model generation-config overrides. Some models reject settings that
+// the primary model accepts: gemini-3.5-flash-lite returns 400
+// INVALID_ARGUMENT for thinkingConfig.thinkingBudget = 0 but accepts
+// thinkingLevel 'minimal' (verified 2026-09-24; gemini-3.5-flash also
+// verified to accept 'minimal'), which made it a fallback that could never
+// succeed.
+const MODEL_THINKING_OVERRIDES = {
+  'gemini-3.5-flash-lite': { thinkingLevel: 'minimal' },
+  'gemini-3.5-flash': { thinkingLevel: 'minimal' }
+};
 
 class LLMService {
   constructor() {
@@ -66,6 +110,95 @@ class LLMService {
     return request;
   }
 
+  /**
+   * Copy of the request adjusted for a specific model (see
+   * MODEL_THINKING_OVERRIDES). The primary model's request is returned
+   * unchanged.
+   */
+  _requestForModel(geminiRequest, modelName) {
+    const thinkingOverride = MODEL_THINKING_OVERRIDES[modelName];
+    if (!thinkingOverride || !geminiRequest.generationConfig || !geminiRequest.generationConfig.thinkingConfig) {
+      return geminiRequest;
+    }
+    return {
+      ...geminiRequest,
+      generationConfig: { ...geminiRequest.generationConfig, thinkingConfig: { ...thinkingOverride } }
+    };
+  }
+
+  /**
+   * Absolute time after which no NEW attempt or retry is started for one
+   * user request (an attempt already in flight is never cut off). Without
+   * this, an overloaded API walked the whole streaming → HTTPS → SDK chain
+   * with backoff (~50s observed) while later questions queued behind it.
+   */
+  _newDeadline() {
+    const budgetMs = config.get('llm.gemini.requestBudgetMs') || 12000;
+    return Date.now() + budgetMs;
+  }
+
+  _deadlinePassed(deadline, extraMs = 0) {
+    return typeof deadline === 'number' && Date.now() + extraMs >= deadline;
+  }
+
+  /** True when the server answered with an HTTP error (as opposed to a network-level failure). */
+  _isHttpStatusError(error) {
+    return !!(error && typeof error.message === 'string' && /^HTTP \d{3}/.test(error.message));
+  }
+
+  /**
+   * Shared non-streaming execution: preferred method first, then the other
+   * one — but the SDK fallback only when it can plausibly help. If the HTTPS
+   * path got a real HTTP error back from Gemini (503 overload, 400, 429…),
+   * the SDK would hit the same server with the same result, so it is skipped;
+   * it's still tried after network-level HTTPS failures. Nothing new starts
+   * once the deadline has passed.
+   */
+  async _executeWithFallback(geminiRequest, deadline) {
+    if (this._deadlinePassed(deadline)) {
+      throw new Error('Gemini request time budget exhausted before non-streaming attempt');
+    }
+
+    const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
+    const primaryFn = preferAlternative ? this.executeAlternativeRequest.bind(this) : this.executeRequest.bind(this);
+    const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
+    const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
+
+    try {
+      return await primaryFn(geminiRequest, deadline);
+    } catch (error) {
+      if (preferAlternative && this._isHttpStatusError(error)) {
+        logger.warn('HTTPS method got an HTTP error from Gemini; skipping SDK fallback (same server, same result)', {
+          error: error.message.substring(0, 200),
+          requestId: this.requestCount
+        });
+        throw error;
+      }
+      if (this._deadlinePassed(deadline)) {
+        logger.warn('Gemini time budget exhausted; skipping secondary method', {
+          error: error.message.substring(0, 200),
+          requestId: this.requestCount
+        });
+        throw error;
+      }
+
+      logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, {
+        error: error.message,
+        requestId: this.requestCount
+      });
+      try {
+        return await secondaryFn(geminiRequest, deadline);
+      } catch (secondaryError) {
+        logger.error('Both Gemini request methods failed', {
+          firstError: error.message,
+          secondError: secondaryError.message,
+          requestId: this.requestCount
+        });
+        throw secondaryError;
+      }
+    }
+  }
+
   extractTextFromCandidates(response) {
     // New @google/genai SDK exposes response.text as a convenience getter.
     if (response && typeof response.text === 'string' && response.text.trim().length > 0) {
@@ -124,7 +257,10 @@ class LLMService {
    * @param {string|null} programmingLanguage - optional language context for skills that need it
    * @returns {Promise<{response: string, metadata: object}>}
    */
-  async processImageWithSkill(imageBuffer, mimeType, activeSkill, sessionMemory = [], programmingLanguage = null) {
+  async processImageWithSkill(imageBuffer, mimeType, activeSkill, sessionMemory = [], programmingLanguage = null, { deadline = null } = {}) {
+    // Called standalone, or as the fallback of a streaming call that passes its
+    // own deadline so the whole chain shares one time budget.
+    deadline = deadline || this._newDeadline();
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -163,30 +299,7 @@ class LLMService {
       }
 
       // Execute with retries/timeout - try alternative method first for network reliability
-      let responseText;
-      const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
-      try {
-        if (preferAlternative) {
-          logger.debug('Attempting alternative HTTPS method first for reliability');
-          responseText = await this.executeAlternativeRequest(request);
-        } else {
-          responseText = await this.executeRequest(request);
-        }
-      } catch (error) {
-        const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
-        logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, { error: error.message });
-        const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
-
-        try {
-          responseText = await secondaryFn(request);
-        } catch (secondaryError) {
-          logger.error('Both Gemini request methods failed', {
-            firstError: error.message,
-            secondError: secondaryError.message
-          });
-          throw secondaryError;
-        }
-      }
+      const responseText = await this._executeWithFallback(request, deadline);
 
       // Enforce language in code fences if provided
       const finalResponse = programmingLanguage
@@ -238,6 +351,7 @@ class LLMService {
     }
 
     const startTime = Date.now();
+    const deadline = this._newDeadline();
     this.requestCount++;
 
     try {
@@ -265,7 +379,7 @@ class LLMService {
         if (typeof onDelta === 'function' && delta) {
           onDelta(delta);
         }
-      });
+      }, deadline);
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -296,16 +410,19 @@ class LLMService {
         error: error.message,
         requestId: this.requestCount
       });
-      return this.processImageWithSkill(imageBuffer, mimeType, activeSkill, sessionMemory, programmingLanguage);
+      return this.processImageWithSkill(imageBuffer, mimeType, activeSkill, sessionMemory, programmingLanguage, { deadline });
     }
   }
 
   formatImageInstruction(activeSkill, programmingLanguage) {
-    const langNote = programmingLanguage ? ` Use only ${programmingLanguage.toUpperCase()} for any code.` : '';
-    return `Analyze this image for a ${activeSkill.toUpperCase()} question. Extract the problem concisely and provide the best possible solution with explanation and final code.${langNote}`;
+    const langNote = programmingLanguage ? ` If code is warranted, use only ${programmingLanguage.toUpperCase()} for it.` : '';
+    return `This screenshot was taken during a ${activeSkill.toUpperCase()} interview. First determine what it actually shows: a conceptual/behavioral question, a coding/implementation problem, or existing code to review/debug/explain. Then respond appropriately for that content — a conceptual question gets a plain-language answer with no code block; a coding problem or a request to modify/debug existing code gets the relevant code. Do not add a code block just because this is a screenshot.${langNote}`;
   }
 
-  async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
+  async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null, { deadline = null } = {}) {
+    // Called standalone, or as the fallback of a streaming call that passes its
+    // own deadline so the whole chain shares one time budget.
+    deadline = deadline || this._newDeadline();
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -324,33 +441,7 @@ class LLMService {
 
       const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
 
-      const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
-      let response;
-      try {
-        if (preferAlternative) {
-          logger.debug('Attempting alternative HTTPS method first for text processing');
-          response = await this.executeAlternativeRequest(geminiRequest);
-        } else {
-          response = await this.executeRequest(geminiRequest);
-        }
-      } catch (error) {
-        const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
-        logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, {
-          error: error.message,
-          requestId: this.requestCount
-        });
-        const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
-        try {
-          response = await secondaryFn(geminiRequest);
-        } catch (secondaryError) {
-          logger.error('Both Gemini request methods failed for text processing', {
-            firstError: error.message,
-            secondError: secondaryError.message,
-            requestId: this.requestCount
-          });
-          throw secondaryError;
-        }
-      }
+      const response = await this._executeWithFallback(geminiRequest, deadline);
       
       // Enforce language in code fences if programmingLanguage specified
       const finalResponse = programmingLanguage
@@ -398,6 +489,7 @@ class LLMService {
     }
 
     const startTime = Date.now();
+    const deadline = this._newDeadline();
     this.requestCount++;
 
     try {
@@ -407,7 +499,7 @@ class LLMService {
         if (typeof onDelta === 'function' && delta) {
           onDelta(delta);
         }
-      });
+      }, deadline);
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -436,11 +528,14 @@ class LLMService {
         error: error.message,
         requestId: this.requestCount
       });
-      return this.processTextWithSkill(text, activeSkill, sessionMemory, programmingLanguage);
+      return this.processTextWithSkill(text, activeSkill, sessionMemory, programmingLanguage, { deadline });
     }
   }
 
-  async processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
+  async processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory = [], programmingLanguage = null, { deadline = null } = {}) {
+    // Called standalone, or as the fallback of a streaming call that passes its
+    // own deadline so the whole chain shares one time budget.
+    deadline = deadline || this._newDeadline();
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -459,33 +554,7 @@ class LLMService {
 
       const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
 
-      const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
-      let response;
-      try {
-        if (preferAlternative) {
-          logger.debug('Attempting alternative HTTPS method first for transcription processing');
-          response = await this.executeAlternativeRequest(geminiRequest);
-        } else {
-          response = await this.executeRequest(geminiRequest);
-        }
-      } catch (error) {
-        const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
-        logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, {
-          error: error.message,
-          requestId: this.requestCount
-        });
-        const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
-        try {
-          response = await secondaryFn(geminiRequest);
-        } catch (secondaryError) {
-          logger.error('Both Gemini request methods failed for transcription processing', {
-            firstError: error.message,
-            secondError: secondaryError.message,
-            requestId: this.requestCount
-          });
-          throw secondaryError;
-        }
-      }
+      const response = await this._executeWithFallback(geminiRequest, deadline);
       
       // Enforce language in code fences if programmingLanguage specified
       const finalResponse = programmingLanguage
@@ -562,7 +631,7 @@ class LLMService {
     
     if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
       const conversationHistory = sessionManager.getConversationHistory(15);
-      const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage, text);
+      const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
       return this.buildGeminiRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage);
     }
 
@@ -668,51 +737,15 @@ class LLMService {
   }
 
   buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage) {
-    // Validate input text first
     const cleanText = text && typeof text === 'string' ? text.trim() : '';
     if (!cleanText) {
       throw new Error('Empty or invalid transcription text provided to buildIntelligentTranscriptionRequest');
     }
 
-    // Check if we have the new conversation history format
     const sessionManager = require('../managers/session.manager');
-    
-    if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
-      const conversationHistory = sessionManager.getConversationHistory(10);
-      const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage, cleanText);
-      return this.buildIntelligentTranscriptionRequestWithHistory(cleanText, activeSkill, conversationHistory, skillContext, programmingLanguage);
-    }
-
-    // Fallback to basic intelligent request
-    const request = {
-      contents: []
-    };
-
-    this.applyGenerationDefaults(request);
-
-    // Add intelligent filtering system instruction
-    const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage, cleanText);
-    if (!intelligentPrompt) {
-      throw new Error('Failed to generate intelligent transcription prompt');
-    }
-
-    request.systemInstruction = {
-      parts: [{ text: intelligentPrompt }]
-    };
-
-    request.contents.push({
-      role: 'user',
-      parts: [{ text: cleanText }]
-    });
-
-    logger.debug('Built basic intelligent transcription request', {
-      skill: activeSkill,
-      programmingLanguage: programmingLanguage || 'not specified',
-      textLength: cleanText.length,
-      hasSystemInstruction: !!request.systemInstruction
-    });
-
-    return request;
+    const conversationHistory = sessionManager.getConversationHistory(10);
+    const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
+    return this.buildIntelligentTranscriptionRequestWithHistory(cleanText, activeSkill, conversationHistory, skillContext, programmingLanguage);
   }
 
   buildIntelligentTranscriptionRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage) {
@@ -722,122 +755,52 @@ class LLMService {
 
     this.applyGenerationDefaults(request);
 
-  // For chat/transcription messages, DO NOT include the full skill prompt; use only the intelligent filter prompt
-  const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage, text);
-  request.systemInstruction = { parts: [{ text: intelligentPrompt }] };
+    // Same profile prompt as typed chat and screenshots (resume, identity and
+    // language blocks included), plus the live-transcript note.
+    if (!skillContext.skillPrompt) {
+      throw new Error(`No prompt found for profile: ${activeSkill}`);
+    }
+    request.systemInstruction = { parts: [{ text: skillContext.skillPrompt + VOICE_TRANSCRIPT_NOTE }] };
 
-    // Add recent conversation history (excluding system messages) with validation
+    // Recent conversation history (excluding system messages). The current
+    // transcript is not in history yet — main.js records it with its answer.
     const conversationContents = conversationHistory
       .filter(event => {
-        // Filter out system messages and ensure content exists and is valid
-        return event.role !== 'system' && 
-               event.content && 
-               typeof event.content === 'string' && 
+        return event.role !== 'system' &&
+               event.content &&
+               typeof event.content === 'string' &&
                event.content.trim().length > 0;
       })
       .slice(-8) // Keep last 8 exchanges for context
-      .map(event => {
-        const content = event.content.trim();
-        if (!content) {
-          logger.warn('Empty content found in conversation history', { event });
-          return null;
-        }
-        return {
-          role: event.role === 'model' ? 'model' : 'user',
-          parts: [{ text: content }]
-        };
-      })
-      .filter(content => content !== null); // Remove any null entries
+      .map(event => ({
+        role: event.role === 'model' ? 'model' : 'user',
+        parts: [{ text: event.content.trim() }]
+      }));
 
-    // Add the conversation history
     request.contents.push(...conversationContents);
-
-    // Validate and add the current transcription
-    const cleanText = text && typeof text === 'string' ? text.trim() : '';
-    if (!cleanText) {
-      throw new Error('Empty or invalid transcription text provided');
-    }
 
     request.contents.push({
       role: 'user',
-      parts: [{ text: cleanText }]
+      parts: [{ text }]
     });
-
-    // Ensure we have at least one content item
-    if (request.contents.length === 0) {
-      throw new Error('No valid content to send to Gemini API');
-    }
 
     logger.debug('Built intelligent transcription request with conversation history', {
       skill: activeSkill,
       programmingLanguage: programmingLanguage || 'not specified',
       historyLength: conversationHistory.length,
       totalContents: request.contents.length,
-      hasSkillPrompt: !!skillContext.skillPrompt,
-      cleanTextLength: cleanText.length,
+      cleanTextLength: text.length,
       requiresProgrammingLanguage: skillContext.requiresProgrammingLanguage || false
     });
 
     return request;
   }
 
-  getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage, questionText = null) {
-    // activeSkill doubles as the active resume profile (android/frontend/
-    // fullstack — see src/core/candidate-context.js and prompts/*.md), no
-    // longer a manually-selected UI skill. Wording below stays profile-
-    // agnostic since all three profiles share the same "never refuse" rule.
-    let prompt = `# Intelligent Transcription Response System
-
-You are assisting a candidate live during a software engineering interview (DSA/algorithms, general programming, Android/Kotlin/mobile, system design, and behavioral questions may all come up in the same conversation). Your job is to respond to each transcribed snippet with appropriate brevity and always be genuinely helpful — never refuse or deflect a question as "not relevant."
-Always respond to the point: do not repeat the question back, and do not include unnecessary preamble.`;
-
-    // Add programming language context if provided
-    if (programmingLanguage) {
-      const lang = String(programmingLanguage).toLowerCase();
-      const languageMap = { cpp: 'C++', c: 'C', kotlin: 'Kotlin', python: 'Python', java: 'Java', javascript: 'JavaScript', js: 'JavaScript' };
-      const fenceTagMap = { cpp: 'cpp', c: 'c', kotlin: 'kotlin', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
-      const languageTitle = languageMap[lang] || (lang.charAt(0).toUpperCase() + lang.slice(1));
-      const fenceTag = fenceTagMap[lang] || lang || 'text';
-      prompt += `\n\nCODING CONTEXT: Respond ONLY in ${languageTitle}. All code blocks must use triple backticks with language tag \`\`\`${fenceTag}\`\`\`. Do not include other languages unless explicitly asked.`;
-    }
-
-    prompt += `
-
-## Response Rules:
-
-- Always give a real, direct, complete answer to whatever the candidate says. A live interview transcript can jump between DSA, general coding, Android/Kotlin, system design, and behavioral questions — answer whatever comes up, in full.
-- For genuinely pure social small talk with zero technical content (e.g. a bare "hello", "how are you", "can you hear me") — give a brief, natural one-line acknowledgment instead of a long technical answer, then stop.
-- If a message has any technical content or an actual question in it, treat it as real and answer it fully — do not mistake casual phrasing for small talk, and never dismiss a message as "not relevant."
-- For real questions: provide a comprehensive, detailed response — use bullet points, examples, and explanations; focus on actionable insights and complete answers; do not truncate or shorten your response.
-- Only include a code block when the message is actually a coding/implementation/debugging question — a selected programming language does not mean every response needs code.
-- For coding/DSA/algorithm questions specifically, structure the answer in this order: (1) problem understanding in plain language, (2) step-by-step approach, (3) simple code first with light inline comments on non-obvious lines only, (4) time complexity, (5) space complexity, (6) brief why-it-works explanation — then an optimized version afterward, in the same order, only if it's meaningfully better than the simple one.
-
-## Response Format:
-- Keep responses detailed and structured (bullet points over long paragraphs).
-- Be encouraging and helpful.
-
-If the user's input is a coding or DSA problem statement and contains no code, produce a complete, runnable solution in the selected programming language without asking for more details. Always include the final implementation in a properly tagged code block.
-
-Remember: brevity means cutting filler, not withholding a real answer. When in doubt about whether something needs a full answer, give one.`;
-
-    // Same token-savings gate as getSkillPrompt() in prompt-loader.js — only
-    // pay the ~1,500-1,800 token resume/metadata cost when it's likely to
-    // matter (behavioral question) or Japanese mode is on (can't self-
-    // translate resume facts into romaji, so needs it available always).
-    if (responseLanguage.isJapaneseModeEnabled() || isPersonalContextRelevant(questionText)) {
-      prompt += getCandidateContextBlock(activeSkill);
-      prompt += getInterviewMetadataBlock();
-    }
-    prompt += responseLanguage.getJapaneseModeInstructionBlock();
-
-    return prompt;
-  }
-
   formatUserMessage(text, activeSkill) {
     return `Context: ${activeSkill.toUpperCase()} analysis request\n\nText to analyze:\n${text}`;
   }
 
-  async executeRequest(geminiRequest) {
+  async executeRequest(geminiRequest, deadline = null) {
     const maxRetries = config.get('llm.gemini.maxRetries');
     const timeout = config.get('llm.gemini.timeout');
     const primaryModel = this.model;
@@ -859,6 +822,11 @@ Remember: brevity means cutting filler, not withholding a real answer. When in d
 
     for (const modelName of modelsToTry) {
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        // Don't start a new attempt once the request's time budget is spent.
+        if (lastError && this._deadlinePassed(deadline)) {
+          logger.warn('Gemini time budget exhausted; not starting another attempt', { model: modelName, attempt });
+          throw lastError;
+        }
         try {
           const timeoutPromise = new Promise((_, reject) =>
             setTimeout(() => reject(new Error('Request timeout')), timeout)
@@ -870,11 +838,16 @@ Remember: brevity means cutting filler, not withholding a real answer. When in d
             model: modelName
           });
 
+          // @google/genai only reads systemInstruction from inside `config`;
+          // passed at the top level it is silently dropped.
+          const modelRequest = this._requestForModel(geminiRequest, modelName);
           const requestPromise = this.client.models.generateContent({
             model: modelName,
-            contents: geminiRequest.contents,
-            config: geminiRequest.generationConfig,
-            systemInstruction: geminiRequest.systemInstruction
+            contents: modelRequest.contents,
+            config: {
+              ...modelRequest.generationConfig,
+              ...(modelRequest.systemInstruction ? { systemInstruction: modelRequest.systemInstruction } : {})
+            }
           });
           const result = await Promise.race([requestPromise, timeoutPromise]);
 
@@ -963,6 +936,9 @@ Remember: brevity means cutting filler, not withholding a real answer. When in d
             model: modelName
           });
 
+          if (this._deadlinePassed(deadline, delay)) {
+            break; // no time left for this backoff; the budget check above ends the loop
+          }
           await this.delay(delay);
         }
       }
@@ -988,6 +964,7 @@ Remember: brevity means cutting filler, not withholding a real answer. When in d
     }
 
     const startTime = Date.now();
+    const deadline = this._newDeadline();
     this.requestCount++;
 
     try {
@@ -997,7 +974,7 @@ Remember: brevity means cutting filler, not withholding a real answer. When in d
         if (typeof onDelta === 'function' && delta) {
           onDelta(delta);
         }
-      });
+      }, deadline);
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -1029,8 +1006,111 @@ Remember: brevity means cutting filler, not withholding a real answer. When in d
       });
       // Non-streaming path returns the same shape; the caller renders it as a
       // single final response.
-      return this.processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory, programmingLanguage);
+      return this.processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory, programmingLanguage, { deadline });
     }
+  }
+
+  /**
+   * Build the "More details" request for a previously answered question.
+   * Focused on that one exchange: original question → original answer →
+   * "More details, please." — no other history, so it stays fast. Uses the
+   * record's own profile/language (the ones that produced the original
+   * answer), never whatever profile happens to be active now.
+   * @param {{kind: string, question: string, answer: string, skill: string,
+   *   programmingLanguage: string|null, imageBuffer?: Buffer, mimeType?: string}} record
+   */
+  buildExpansionRequest(record) {
+    if (!record || !record.answer) {
+      throw new Error('Expansion request needs the original answer');
+    }
+
+    const skillPrompt = promptLoader.getSkillPrompt(record.skill, record.programmingLanguage);
+    if (!skillPrompt) {
+      throw new Error(`No prompt found for profile: ${record.skill}`);
+    }
+
+    const questionParts = record.kind === 'image' && record.imageBuffer
+      ? [
+          { text: this.formatImageInstruction(record.skill, record.programmingLanguage) },
+          { inlineData: { data: record.imageBuffer.toString('base64'), mimeType: record.mimeType || 'image/png' } }
+        ]
+      : [{ text: String(record.question || '').trim() || '(question not available)' }];
+
+    const request = {
+      contents: [
+        { role: 'user', parts: questionParts },
+        { role: 'model', parts: [{ text: record.answer }] },
+        { role: 'user', parts: [{ text: 'More details, please.' }] }
+      ]
+    };
+    this.applyGenerationDefaults(request);
+    request.systemInstruction = { parts: [{ text: skillPrompt + EXPANSION_NOTE }] };
+    return request;
+  }
+
+  /**
+   * User-triggered "More details" for an existing answer. Same streaming,
+   * model-fallback and time-budget path as normal answers, but on total
+   * failure it throws instead of returning the canned "could you repeat"
+   * text — the UI turns that into a retry button.
+   */
+  async processExpansionStream(record, onDelta = null) {
+    if (!this.isInitialized) {
+      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+    }
+
+    const startTime = Date.now();
+    const deadline = this._newDeadline();
+    this.requestCount++;
+
+    const geminiRequest = this.buildExpansionRequest(record);
+
+    let fullText;
+    let streamed = true;
+    try {
+      fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
+        if (typeof onDelta === 'function' && delta) {
+          onDelta(delta);
+        }
+      }, deadline);
+    } catch (error) {
+      logger.warn('Streaming expansion failed, falling back to non-streaming', {
+        error: error.message,
+        requestId: this.requestCount
+      });
+      streamed = false;
+      try {
+        fullText = await this._executeWithFallback(geminiRequest, deadline);
+      } catch (secondError) {
+        this.errorCount++;
+        throw secondError;
+      }
+    }
+
+    const finalResponse = record.programmingLanguage
+      ? this.enforceProgrammingLanguage(fullText, record.programmingLanguage)
+      : fullText;
+
+    logger.logPerformance('LLM expansion', startTime, {
+      activeSkill: record.skill,
+      kind: record.kind,
+      originalLength: record.answer.length,
+      responseLength: finalResponse.length,
+      requestId: this.requestCount
+    });
+
+    return {
+      response: finalResponse,
+      metadata: {
+        skill: record.skill,
+        programmingLanguage: record.programmingLanguage,
+        processingTime: Date.now() - startTime,
+        requestId: this.requestCount,
+        usedFallback: false,
+        streamed,
+        isExpansion: true
+      }
+    };
   }
 
   /** Safely pull the text delta out of a streamed Gemini chunk. */
@@ -1057,7 +1137,7 @@ Remember: brevity means cutting filler, not withholding a real answer. When in d
    * as executeRequest. Accumulates and returns the full text; invokes onDelta
    * for each chunk.
    */
-  async executeStreamingRequest(geminiRequest, onDelta) {
+  async executeStreamingRequest(geminiRequest, onDelta, deadline = null) {
     const maxRetries = config.get('llm.gemini.maxRetries');
     const apiKey = config.getApiKey('GEMINI');
     const primaryModel = this.model;
@@ -1068,8 +1148,13 @@ Remember: brevity means cutting filler, not withholding a real answer. When in d
 
     for (const modelName of modelsToTry) {
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        // Don't start a new attempt once the request's time budget is spent.
+        if (lastError && this._deadlinePassed(deadline)) {
+          logger.warn('Gemini time budget exhausted; not starting another attempt', { model: modelName, attempt });
+          throw lastError;
+        }
         try {
-          const fullText = await this._streamRequestForModel(geminiRequest, modelName, apiKey, onDelta);
+          const fullText = await this._streamRequestForModel(this._requestForModel(geminiRequest, modelName), modelName, apiKey, onDelta);
 
           if (!fullText) {
             throw new Error('Empty streamed response from Gemini API');
@@ -1111,6 +1196,9 @@ Remember: brevity means cutting filler, not withholding a real answer. When in d
 
           const baseDelay = errorInfo.isNetworkError ? 2500 : 1500;
           const delay = baseDelay * attempt + Math.random() * 1000;
+          if (this._deadlinePassed(deadline, delay)) {
+            break; // no time left for this backoff; the budget check above ends the loop
+          }
           await this.delay(delay);
         }
       }
@@ -1525,7 +1613,7 @@ Remember: brevity means cutting filler, not withholding a real answer. When in d
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  async executeAlternativeRequest(geminiRequest) {
+  async executeAlternativeRequest(geminiRequest, deadline = null) {
     const https = require('https');
     const apiKey = config.getApiKey('GEMINI');
     const primaryModel = config.get('llm.gemini.model');
@@ -1537,8 +1625,12 @@ Remember: brevity means cutting filler, not withholding a real answer. When in d
     let lastError = null;
 
     for (const modelName of modelsToTry) {
+      if (lastError && this._deadlinePassed(deadline)) {
+        logger.warn('Gemini time budget exhausted; not trying further models', { model: modelName });
+        break;
+      }
       try {
-        const result = await this._executeAlternativeRequestForModel(geminiRequest, modelName, apiKey);
+        const result = await this._executeAlternativeRequestForModel(this._requestForModel(geminiRequest, modelName), modelName, apiKey);
         return result;
       } catch (error) {
         lastError = error;

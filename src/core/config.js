@@ -49,6 +49,10 @@ class ConfigManager {
           fallbackModels: ['gemini-3.5-flash-lite', 'gemini-3.5-flash'],
           maxRetries: 3,
           timeout: 30000,
+          // Total time budget (ms) per user request across streaming, HTTPS
+          // and SDK fallbacks: no new attempt/retry starts after it (an
+          // attempt already running is not cut off).
+          requestBudgetMs: 12000,
           fallbackEnabled: true,
           enableFallbackMethod: true,
           generation: {

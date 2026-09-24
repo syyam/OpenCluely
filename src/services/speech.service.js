@@ -387,6 +387,7 @@ const { EventEmitter } = require('events');
 const logger = require('../core/logger').createServiceLogger('SPEECH');
 const config = require('../core/config');
 const WhisperWorkerService = require('./whisper-worker.service');
+const responseLanguage = require('../core/response-language');
 
 let sdk = null;
 try {
@@ -429,6 +430,19 @@ class SpeechService extends EventEmitter {
     this.isProcessingAudio = false;
     this.manualStopRequested = false;
     this._resetVadState();
+
+    // "My Microphone" - a second, independent, off-by-default input channel
+    // (see startMicListening/stopMicListening below) kept as its own small
+    // state machine rather than parameterizing the meeting-audio VAD above,
+    // so this additive feature can't affect the already-tuned meeting-audio
+    // pipeline's behavior at all.
+    this.micListening = false;
+    this._resetMicVadState();
+    this.micSegmentBuffers = [];
+    this.micSegmentBytes = 0;
+    this.micTranscriptionInFlight = false;
+    this.micPendingFlush = false;
+    this.micSegmentTimer = null;
 
     this.initializeClient();
   }
@@ -697,7 +711,11 @@ class SpeechService extends EventEmitter {
         logger.info('Whisper GPU warmup completed while recording', {
           model: result.model,
           device: result.device,
-          gpu: result.gpu
+          gpu: result.gpu,
+          cudaAvailable: result.cuda_available,
+          modelLoadMs: result.modelLoadMs,
+          modelFreshlyLoaded: result.modelFreshlyLoaded,
+          warmupInferenceMs: result.warmupInferenceMs
         });
       }).catch((error) => {
         logger.warn('Whisper warmup failed; transcription will use fallback', {
@@ -942,6 +960,211 @@ class SpeechService extends EventEmitter {
   _chunkDurationMs(buffer) {
     // 16kHz mono 16-bit => 2 bytes/sample => 32 bytes/ms.
     return buffer.length / 32;
+  }
+
+  // ---------------------------------------------------------------------
+  // "My Microphone" channel - independent of Meeting Audio (isRecording/
+  // startRecording/stopRecording above). Off by default; the renderer only
+  // starts sending mic-audio-chunk data once this is toggled on. Shares the
+  // same VAD threshold getters and Whisper transcription/hallucination-
+  // filter helpers as the meeting channel, but keeps its own buffers/state
+  // so turning either channel on or off never touches the other's audio.
+  // ---------------------------------------------------------------------
+
+  _resetMicVadState() {
+    this.micVadSpeaking = false;
+    this.micVadSpeechMs = 0;
+    this.micVadSilenceMs = 0;
+    this.micVadNoiseFloor = 0;
+    this.micVadNoiseInit = false;
+    this.micVadPreRoll = [];
+    this.micVadPreRollMs = 0;
+    this.micVadLastChunkAt = 0;
+  }
+
+  startMicListening() {
+    if (this.micListening) {
+      return;
+    }
+    this.micListening = true;
+    this.micSegmentBuffers = [];
+    this.micSegmentBytes = 0;
+    this.micTranscriptionInFlight = false;
+    this.micPendingFlush = false;
+    this.micPendingFinal = false;
+    this._resetMicVadState();
+
+    if (this.micSegmentTimer) {
+      clearInterval(this.micSegmentTimer);
+    }
+    this.micSegmentTimer = setInterval(() => {
+      if (!this.micListening) {
+        return;
+      }
+      const sinceLastChunk = this.micVadLastChunkAt ? Date.now() - this.micVadLastChunkAt : 0;
+      const stalled = this.micVadSpeaking && sinceLastChunk > 1500;
+      const tooLong = this.micVadSpeaking && this.micVadSpeechMs >= this._getMaxUtteranceMs();
+      if (stalled || tooLong) {
+        this._endMicUtteranceFlush();
+      }
+    }, 500);
+
+    logger.info('My Microphone listening started');
+  }
+
+  stopMicListening() {
+    if (!this.micListening) {
+      return;
+    }
+    this.micListening = false;
+    if (this.micSegmentTimer) {
+      clearInterval(this.micSegmentTimer);
+      this.micSegmentTimer = null;
+    }
+    if (this.micSegmentBytes) {
+      // Flush whatever's buffered so a mid-sentence toggle-off isn't lost.
+      this._endMicUtteranceFlush();
+    }
+    logger.info('My Microphone listening stopped');
+  }
+
+  handleMicAudioChunkFromRenderer(chunk) {
+    if (!this.micListening || !chunk || !chunk.length) {
+      return;
+    }
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    this._ingestMicAudio(buffer);
+  }
+
+  /** Same VAD decision logic as _ingestWhisperAudio, applied to the mic channel's own state. */
+  _ingestMicAudio(buffer) {
+    this.micVadLastChunkAt = Date.now();
+    const chunkMs = this._chunkDurationMs(buffer);
+    const energy = this._chunkRmsEnergy(buffer);
+
+    const floor = this._getVadEnergyFloor();
+    if (!this.micVadNoiseInit) {
+      this.micVadNoiseFloor = Math.min(energy, floor);
+      this.micVadNoiseInit = true;
+    }
+    const enterThreshold = Math.max(floor, this.micVadNoiseFloor * 2.5);
+    const exitThreshold = Math.max(floor * 0.7, this.micVadNoiseFloor * 1.6);
+    const isVoiced = this.micVadSpeaking ? energy >= exitThreshold : energy >= enterThreshold;
+
+    if (!this.micVadSpeaking) {
+      if (isVoiced) {
+        this.micVadSpeaking = true;
+        this.micVadSpeechMs = 0;
+        this.micVadSilenceMs = 0;
+        for (const pre of this.micVadPreRoll) {
+          this.micSegmentBuffers.push(pre);
+          this.micSegmentBytes += pre.length;
+        }
+        this.micVadPreRoll = [];
+        this.micVadPreRollMs = 0;
+        this.micSegmentBuffers.push(buffer);
+        this.micSegmentBytes += buffer.length;
+        this.micVadSpeechMs += chunkMs;
+      } else {
+        this.micVadNoiseFloor = this.micVadNoiseFloor * 0.95 + energy * 0.05;
+        this.micVadPreRoll.push(buffer);
+        this.micVadPreRollMs += chunkMs;
+        const preRollLimit = this._getPreRollMs();
+        while (this.micVadPreRollMs > preRollLimit && this.micVadPreRoll.length > 1) {
+          const dropped = this.micVadPreRoll.shift();
+          this.micVadPreRollMs -= this._chunkDurationMs(dropped);
+        }
+      }
+      return;
+    }
+
+    this.micSegmentBuffers.push(buffer);
+    this.micSegmentBytes += buffer.length;
+    if (isVoiced) {
+      this.micVadSpeechMs += chunkMs;
+      this.micVadSilenceMs = 0;
+    } else {
+      this.micVadSilenceMs += chunkMs;
+    }
+
+    const pausedLongEnough = this.micVadSilenceMs >= this._getSilenceHangoverMs();
+    const haveRealSpeech = this.micVadSpeechMs >= this._getMinUtteranceMs();
+    const tooLong = this.micVadSpeechMs >= this._getMaxUtteranceMs();
+
+    if ((pausedLongEnough && haveRealSpeech) || tooLong) {
+      this._endMicUtteranceFlush();
+    } else if (pausedLongEnough && !haveRealSpeech) {
+      this.micSegmentBuffers = [];
+      this.micSegmentBytes = 0;
+      this.micVadSpeaking = false;
+      this.micVadSpeechMs = 0;
+      this.micVadSilenceMs = 0;
+    }
+  }
+
+  _endMicUtteranceFlush() {
+    this.micVadSpeaking = false;
+    this.micVadSpeechMs = 0;
+    this.micVadSilenceMs = 0;
+    this.micVadPreRoll = [];
+    this.micVadPreRollMs = 0;
+    this._flushMicSegment({ final: false }).catch((error) => {
+      logger.error('Mic segment transcription failed', { error: error.message });
+    });
+  }
+
+  async _flushMicSegment({ final }) {
+    if (this.micTranscriptionInFlight) {
+      this.micPendingFlush = true;
+      if (final) {
+        this.micPendingFinal = true;
+      }
+      return;
+    }
+
+    if (!this.micSegmentBytes) {
+      return;
+    }
+
+    const audioBuffer = Buffer.concat(this.micSegmentBuffers, this.micSegmentBytes);
+    const segmentDurationMs = Math.round(this.micSegmentBytes / 32);
+    this.micSegmentBuffers = [];
+    this.micSegmentBytes = 0;
+
+    this.micTranscriptionInFlight = true;
+
+    try {
+      const result = await this._transcribeWhisperBuffer(audioBuffer);
+      const transcript = result ? result.text : '';
+      const detectedLanguage = result ? result.language : null;
+      const noSpeechProb = result ? result.noSpeechProb : null;
+      const clean = transcript ? transcript.trim() : '';
+      if (!clean) {
+        logger.info('My Microphone segment produced no text', { segmentDurationMs, detectedLanguage });
+      } else {
+        const dropReason = this._isHallucinatedTranscript(clean, detectedLanguage, noSpeechProb);
+        if (!dropReason) {
+          this.emit('transcription', clean, { source: 'mic' });
+        } else {
+          logger.warn('Dropped likely Whisper hallucination/noise (My Microphone)', {
+            transcript: clean,
+            detectedLanguage,
+            noSpeechProb,
+            reason: dropReason,
+            segmentDurationMs
+          });
+        }
+      }
+    } finally {
+      this.micTranscriptionInFlight = false;
+
+      if (this.micPendingFlush) {
+        this.micPendingFlush = false;
+        const runFinal = this.micPendingFinal;
+        this.micPendingFinal = false;
+        await this._flushMicSegment({ final: runFinal });
+      }
+    }
   }
 
   stopRecording() {
@@ -1208,25 +1431,8 @@ class SpeechService extends EventEmitter {
     this.isRecording = false;
     this.isProcessingAudio = false;
     this._cleanup();
+    this.stopMicListening();
     this.whisperWorker.close();
-  }
-
-  updateSettings(settings = {}) {
-    const speechKeys = ['speechProvider', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperCaptureMode', 'whisperDevice', 'whisperSegmentMs'];
-    let changed = false;
-
-    for (const key of speechKeys) {
-      if (Object.prototype.hasOwnProperty.call(settings, key)) {
-        this.runtimeSettings[key] = settings[key];
-        changed = true;
-      }
-    }
-
-    if (changed) {
-      this.initializeClient();
-    }
-
-    return this.getStatus();
   }
 
   _getConfiguredProvider() {
@@ -1826,6 +2032,12 @@ class SpeechService extends EventEmitter {
     }
 
     const audioBuffer = Buffer.concat(this.segmentBuffers, this.segmentBytes);
+    // 16kHz mono 16-bit PCM = 32 bytes/ms. Captured before the reset below so
+    // it can be logged alongside the transcription result - the only way to
+    // tell "Whisper heard nothing" apart from "it heard something and the
+    // filter dropped it" apart from "the mic barely captured any audio at
+    // all" from the log after the fact.
+    const segmentDurationMs = Math.round(this.segmentBytes / 32);
     this.segmentBuffers = [];
     this.segmentBytes = 0;
 
@@ -1835,11 +2047,26 @@ class SpeechService extends EventEmitter {
       const result = await this._transcribeWhisperBuffer(audioBuffer);
       const transcript = result ? result.text : '';
       const detectedLanguage = result ? result.language : null;
+      const noSpeechProb = result ? result.noSpeechProb : null;
       const clean = transcript ? transcript.trim() : '';
-      if (clean && !this._isHallucinatedTranscript(clean, detectedLanguage)) {
-        this.emit('transcription', clean);
-      } else if (clean) {
-        logger.debug('Dropped likely Whisper hallucination/noise', { transcript: clean, detectedLanguage });
+      if (!clean) {
+        logger.info('Whisper segment produced no text', { segmentDurationMs, detectedLanguage });
+      } else {
+        const dropReason = this._isHallucinatedTranscript(clean, detectedLanguage, noSpeechProb);
+        if (!dropReason) {
+          this.emit('transcription', clean, { source: 'meeting' });
+        } else {
+          // warn (not debug) - this is exactly the signal needed to tell a
+          // real dropped utterance apart from audio that never reached
+          // Whisper as speech in the first place.
+          logger.warn('Dropped likely Whisper hallucination/noise', {
+            transcript: clean,
+            detectedLanguage,
+            noSpeechProb,
+            reason: dropReason,
+            segmentDurationMs
+          });
+        }
       }
     } finally {
       this.transcriptionInFlight = false;
@@ -1859,7 +2086,7 @@ class SpeechService extends EventEmitter {
    * and subtitles). VAD already prevents most silent flushes; this is the
    * final guard so these phantom phrases never reach the chat or the LLM.
    *
-   * Three independent signals, any one of which drops the transcript:
+   * Four independent signals, any one of which drops the transcript:
    *  1. An exact match against a small set of known stock hallucination
    *     phrases (cheap, catches the most common English ones).
    *  2. Excessive word/phrase repetition — hallucinated noise transcripts
@@ -1872,14 +2099,25 @@ class SpeechService extends EventEmitter {
    *     noise (observed live: 26x "Продолжение следует...", 5x "Спасибо...")
    *     is a strong noise signal on its own. Only applied when a detected
    *     language was actually returned — never drops on an unknown language.
+   *     Japanese is only allowed through when Japanese response mode is on;
+   *     otherwise a 'ja' detection on ambient noise/echo is just as much a
+   *     noise signal as any other non-English language.
+   *  4. Whisper's own no_speech_prob for the segment — this is the model's
+   *     built-in confidence that the audio was not speech at all (silence,
+   *     breathing, fan/keyboard noise). Root-causing "useless audio" at this
+   *     signal is more reliable than any text-pattern heuristic, since it's
+   *     Whisper judging its own input rather than us judging its output.
+   *
+   * Returns null when the transcript should be kept, or a short reason
+   * string (for logging) when it's dropped.
    */
-  _isHallucinatedTranscript(text, detectedLanguage = null) {
+  _isHallucinatedTranscript(text, detectedLanguage = null, noSpeechProb = null) {
     // Hyphens are treated as word separators too, not just stripped — a
     // hallucinated "T-T-T-T-T..." loop has no whitespace at all otherwise,
     // which would hide it from the repetition check below (single "word").
     const normalized = text.toLowerCase().replace(/[\s.,!?¡¿"'`-]+/g, ' ').trim();
     if (!normalized) {
-      return true;
+      return 'empty';
     }
 
     const HALLUCINATIONS = new Set([
@@ -1896,22 +2134,47 @@ class SpeechService extends EventEmitter {
       'ok',
       'so',
       'the end',
-      'subtitles by the amara org community'
+      'subtitles by the amara org community',
+      // Japanese counterparts of the same subtitle/outro hallucination
+      // family — needed now that 'ja' is an allowed transcript language
+      // (see ALLOWED_TRANSCRIPT_LANGUAGES below), otherwise this exact
+      // class of noise hallucination sails through unfiltered whenever
+      // Whisper mis-detects it as Japanese instead of English.
+      'ご視聴ありがとうございました',
+      'ご視聴ありがとうございます',
+      'ご清聴ありがとうございました',
+      'チャンネル登録をお願いします',
+      'チャンネル登録よろしくお願いします',
+      '最後までご視聴いただきありがとうございました'
     ]);
     if (HALLUCINATIONS.has(normalized)) {
-      return true;
+      return 'stock_phrase';
     }
 
     if (this._hasExcessiveRepetition(normalized)) {
-      return true;
+      return 'repetition';
     }
 
-    const ALLOWED_TRANSCRIPT_LANGUAGES = new Set(['en', 'ja']);
-    if (detectedLanguage && !ALLOWED_TRANSCRIPT_LANGUAGES.has(String(detectedLanguage).toLowerCase())) {
-      return true;
+    // 'ja' is only a legitimate transcript language while Japanese response
+    // mode is on — otherwise it's the same class of noise-misdetection as
+    // any other non-English language (see class doc above).
+    const allowedLanguages = responseLanguage.isJapaneseModeEnabled()
+      ? new Set(['en', 'ja'])
+      : new Set(['en']);
+    if (detectedLanguage && !allowedLanguages.has(String(detectedLanguage).toLowerCase())) {
+      return `language:${detectedLanguage}`;
     }
 
-    return false;
+    // High no_speech_prob means Whisper itself judged this segment as
+    // unlikely to contain speech (matches the CLI's own default threshold),
+    // yet still emitted some text - the classic hallucination-on-silence
+    // failure mode. Text-based checks above may miss a hallucination that
+    // isn't a known stock phrase or a repeated loop; this catches those.
+    if (typeof noSpeechProb === 'number' && noSpeechProb >= 0.6) {
+      return 'low_speech_confidence';
+    }
+
+    return null;
   }
 
   /**
@@ -1980,14 +2243,28 @@ class SpeechService extends EventEmitter {
           modelDir: this._getWhisperModelDir(),
           device: this._getWhisperDevice()
         });
+        const totalMs = Date.now() - startedAt;
+        const inferenceMs = typeof result.inferenceMs === 'number' ? result.inferenceMs : null;
+        const modelLoadMs = typeof result.modelLoadMs === 'number' ? result.modelLoadMs : 0;
         logger.info('Persistent Whisper transcription completed', {
-          processingTime: Date.now() - startedAt,
+          processingTime: totalMs,
           model: result.model,
           device: result.device,
           gpu: result.gpu,
-          detectedLanguage: result.language
+          cudaAvailable: result.cuda_available,
+          detectedLanguage: result.language,
+          audioDurationSec: result.audioDurationSec,
+          modelLoadMs,
+          modelFreshlyLoaded: result.modelFreshlyLoaded,
+          inferenceMs,
+          rtf: result.rtf,
+          queueMs: inferenceMs === null ? null : Math.max(0, totalMs - inferenceMs - modelLoadMs)
         });
-        return { text: result.text || '', language: result.language || null };
+        return {
+          text: result.text || '',
+          language: result.language || null,
+          noSpeechProb: typeof result.noSpeechProb === 'number' ? result.noSpeechProb : null
+        };
       } catch (error) {
         logger.warn('Persistent Whisper worker failed; falling back to CLI', {
           error: error.message,
@@ -2044,15 +2321,19 @@ class SpeechService extends EventEmitter {
 
       const transcriptPath = path.join(outputDir, `${path.parse(audioFilePath).name}.json`);
       if (!fs.existsSync(transcriptPath)) {
-        return { text: '', language: null };
+        return { text: '', language: null, noSpeechProb: null };
       }
 
       try {
         const parsed = JSON.parse(fs.readFileSync(transcriptPath, 'utf8'));
-        return { text: (parsed.text || '').trim(), language: parsed.language || null };
+        const segments = Array.isArray(parsed.segments) ? parsed.segments : [];
+        const noSpeechProb = segments.length
+          ? Math.max(...segments.map((s) => (typeof s.no_speech_prob === 'number' ? s.no_speech_prob : 0)))
+          : null;
+        return { text: (parsed.text || '').trim(), language: parsed.language || null, noSpeechProb };
       } catch (error) {
         logger.warn('Failed to parse Whisper CLI JSON output', { error: error.message });
-        return { text: '', language: null };
+        return { text: '', language: null, noSpeechProb: null };
       }
     } finally {
       this._removeTempDir(outputDir);

@@ -85,42 +85,14 @@ async function extractTextFromFile(filePath) {
 // answers are tailored to this specific candidate/profile instead of
 // generic advice. Returns '' (no-op) when nothing has been saved for that
 // profile yet. profileId is the active skill value ('android'/'frontend'/
-// 'fullstack') — defaults to the Android profile if omitted/unrecognized.
+// 'fullstack'/any profile added to PROFILES).
 function getCandidateContextBlock(profileId) {
+  // Strict: an unrecognized profile id gets no resume rather than falling
+  // back to the default profile's — never inject another profile's resume.
+  if (!Object.prototype.hasOwnProperty.call(PROFILES, profileId)) return '';
   const text = readCandidateContext(profileId).trim();
   if (!text) return '';
   return `\n\n## Candidate Background\nThe following is the candidate's actual resume/background. Tailor answers, examples, and follow-up depth to their real experience level and stack — don't ask them to restate it, and don't assume experience they don't have.\n\n${text}`;
-}
-
-// Cheap, local (no API call) check for whether a question is likely to need
-// the resume/interview-metadata context — behavioral/self-intro/personal
-// questions, not plain technical ones. Used to skip ~1,500-1,800 tokens of
-// unconditional context on the common case (see getSkillPrompt/
-// getIntelligentTranscriptionPrompt). Deliberately a heuristic, not a
-// refusal gate: a miss here just means Gemini answers without the resume
-// (graceful — see the Behavioral section's own fallback), never a wrong or
-// dismissed answer, so false negatives/positives are both low-stakes.
-const PERSONAL_CONTEXT_PATTERNS = [
-  /tell me about yourself/i,
-  /walk me through your (resume|background)/i,
-  /introduce yourself/i,
-  /jiko\s*shoukai/i,
-  /why (do you want|are you interested|this role|this company|(are you )?leaving)/i,
-  /biggest (challenge|strength|weakness|achievement|failure|mistake)/i,
-  /strengths? and weaknesses?/i,
-  /tell me about a time/i,
-  /describe a situation/i,
-  /give (me )?an example of/i,
-  /your (experience|background|resume|visa|work authorization)/i,
-  /relocat/i,
-  /notice period/i,
-  /current (company|employer|role|job)/i,
-  /leadership|teamwork|conflict resolution|mentor(ed|ing)?/i,
-];
-
-function isPersonalContextRelevant(text) {
-  if (!text || typeof text !== 'string') return false;
-  return PERSONAL_CONTEXT_PATTERNS.some((re) => re.test(text));
 }
 
 module.exports = {
@@ -134,5 +106,4 @@ module.exports = {
   writeCandidateContext,
   extractTextFromFile,
   getCandidateContextBlock,
-  isPersonalContextRelevant,
 };

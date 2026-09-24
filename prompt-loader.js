@@ -1,15 +1,15 @@
 const fs = require('fs');
 const path = require('path');
-const { getCandidateContextBlock, isPersonalContextRelevant } = require('./src/core/candidate-context');
+const { getCandidateContextBlock } = require('./src/core/candidate-context');
 const { getInterviewMetadataBlock } = require('./src/core/interview-metadata');
-const { getJapaneseModeInstructionBlock, isJapaneseModeEnabled } = require('./src/core/response-language');
+const { getResponseLanguageInstructionBlock } = require('./src/core/response-language');
+const { getIdentityBlock } = require('./src/core/identity');
 
 class PromptLoader {
   constructor() {
     this.prompts = new Map();
     this.promptsLoaded = false;
     this.skillPromptSent = new Set();
-    this.skillsRequiringProgrammingLanguage = ['android', 'frontend', 'fullstack'];
   }
 
   /**
@@ -49,12 +49,9 @@ class PromptLoader {
    * Get the system prompt for a specific skill with optional programming language injection
    * @param {string} skillName - The name of the skill
    * @param {string|null} programmingLanguage - Optional programming language to inject
-   * @param {string|null} questionText - The actual question being asked, used only to decide
-   *   whether the resume/interview-metadata blocks are worth including (see
-   *   isPersonalContextRelevant) — not otherwise part of the prompt itself.
    * @returns {string|null} The system prompt content or null if not found
    */
-  getSkillPrompt(skillName, programmingLanguage = null, questionText = null) {
+  getSkillPrompt(skillName, programmingLanguage = null) {
     if (!this.promptsLoaded) {
       this.loadPrompts();
     }
@@ -67,27 +64,21 @@ class PromptLoader {
     }
 
     // Inject programming language if provided and skill requires it
-    if (programmingLanguage && this.skillsRequiringProgrammingLanguage.includes(normalizedSkillName)) {
+    if (programmingLanguage && this.requiresProgrammingLanguage(normalizedSkillName)) {
       promptContent = this.injectProgrammingLanguage(promptContent, programmingLanguage, normalizedSkillName);
     }
 
-    // The resume + interview-metadata blocks are ~1,500-1,800 tokens —
-    // real weight to pay on every plain technical question. Only include
-    // them when they're actually likely to matter: a behavioral/personal-
-    // sounding question, or Japanese mode is on (the candidate can't
-    // self-translate their own resume facts into romaji, so needs them
-    // available for every question while practicing in Japanese).
-    if (isJapaneseModeEnabled() || isPersonalContextRelevant(questionText)) {
-      // normalizedSkillName doubles as the active resume-profile id
-      // (android/frontend/fullstack).
-      promptContent += getCandidateContextBlock(normalizedSkillName);
-      // Global, not per-profile: visa/relocation/self-intro notes apply
-      // regardless of active resume profile.
-      promptContent += getInterviewMetadataBlock();
-    }
-    // Unconditional on Japanese mode alone — a formatting rule, not
-    // personal content, so it's independent of the gate above.
-    promptContent += getJapaneseModeInstructionBlock();
+    // Always included: the active profile's resume (normalizedSkillName
+    // doubles as the resume-profile id, so only that profile's resume is
+    // read — never another profile's) plus the global interview notes
+    // (visa/relocation/self-intro, profile-independent by design).
+    promptContent += getCandidateContextBlock(normalizedSkillName);
+    promptContent += getInterviewMetadataBlock();
+    // How to voice the answer (as Syyam, no AI self-reference, no filler).
+    promptContent += getIdentityBlock();
+    // The only thing establishing a default output language (English) when
+    // Japanese mode is off.
+    promptContent += getResponseLanguageInstructionBlock();
 
     return promptContent;
   }
@@ -107,24 +98,19 @@ class PromptLoader {
     const fenceTag = fenceTagMap[norm] || norm || 'text';
     const languageUpper = (languageMap[norm] || languageTitle).toUpperCase();
     
-    let languageInjection = '';
-    
-    switch (skillName) {
-      case 'android':
-      case 'frontend':
-      case 'fullstack':
-        languageInjection = `\n\n## IMPLEMENTATION LANGUAGE: ${languageUpper}
-STRICT REQUIREMENTS:
+    // Same rules for every profile (android/frontend/fullstack/any added
+    // later): code only when the question actually calls for it.
+    const languageInjection = `\n\n## IMPLEMENTATION LANGUAGE (when code is actually needed): ${languageUpper}
+Selecting ${languageTitle} here does NOT mean "include code in every technical answer" — it only means "if code is required, use this language." A technical question is not automatically a coding question; distinguish the two.
+Do NOT include a code block for conceptual/behavioral questions such as: "what is X", "how does X work", "why use X", "what's the difference between X and Y", "tell me about your experience with X", "how did you solve/approach X". Answer these as a concise verbal explanation. If a specific function, class, or library name needs to be mentioned, put it inline as a short code-highlighted span within the prose, not a fenced code block.
+DO include a code block only when: the interviewer explicitly asks to implement/write/code something, the question is a clear coding/algorithm problem, existing code is given and needs debugging/modifying/explaining, or a screenshot clearly shows a coding problem expecting an implementation. Even then, prefer a brief verbal explanation first unless code materially helps answer the question.
+When code IS warranted:
 - Respond ONLY in ${languageTitle}. Do not include any snippets or alternatives in other languages.
 - All code blocks must use triple backticks with the exact language tag: \`\`\`${fenceTag}\`\`\`.
 - Aim for the best possible time and space complexity; prefer optimal algorithms and data structures.
 - Provide: brief approach, then final ${languageTitle} implementation, followed by time/space complexity.
 - If the user's input is a problem statement (and does not include code), produce a complete, runnable ${languageTitle} solution without asking for clarification.
 - Avoid unnecessary verbosity; focus on correctness, clarity, and efficiency.`;
-        break;
-      default:
-        languageInjection = `\n\n## PROGRAMMING LANGUAGE: ${languageUpper}\nAll code and examples must be in ${languageTitle}. Use code fences with tag: \`\`\`${fenceTag}\`\`\`.`;
-    }
 
     return promptContent + languageInjection;
   }
@@ -174,7 +160,7 @@ STRICT REQUIREMENTS:
    */
   prepareGeminiRequest(skillName, userMessage, storedMemory, programmingLanguage = null) {
     const normalizedSkillName = this.normalizeSkillName(skillName);
-    const skillPrompt = this.getSkillPrompt(normalizedSkillName, programmingLanguage, userMessage);
+    const skillPrompt = this.getSkillPrompt(normalizedSkillName, programmingLanguage);
     
     const requestConfig = {
       model: 'gemini-pro', // or your preferred Gemini model
@@ -239,7 +225,7 @@ STRICT REQUIREMENTS:
   getRequestComponents(skillName, userMessage, storedMemory, programmingLanguage = null) {
     const normalizedSkillName = this.normalizeSkillName(skillName);
     const shouldUseModelMemory = this.shouldSendAsModelMemory(skillName, storedMemory);
-    const skillPrompt = this.getSkillPrompt(normalizedSkillName, programmingLanguage, userMessage);
+    const skillPrompt = this.getSkillPrompt(normalizedSkillName, programmingLanguage);
 
     return {
       skillName: normalizedSkillName,
@@ -250,7 +236,7 @@ STRICT REQUIREMENTS:
       modelMemory: shouldUseModelMemory && skillPrompt ? skillPrompt : null,
       messageContent: userMessage,
       programmingLanguage,
-      requiresProgrammingLanguage: this.skillsRequiringProgrammingLanguage.includes(normalizedSkillName)
+      requiresProgrammingLanguage: this.requiresProgrammingLanguage(normalizedSkillName)
     };
   }
 
@@ -323,8 +309,13 @@ STRICT REQUIREMENTS:
    * @returns {boolean} True if skill requires programming language
    */
   requiresProgrammingLanguage(skillName) {
-    const normalizedSkillName = this.normalizeSkillName(skillName);
-    return this.skillsRequiringProgrammingLanguage.includes(normalizedSkillName);
+    // Every prompts/<id>.md is an interview profile (android/frontend/
+    // fullstack/…), and all of them take the implementation-language
+    // injection — so a newly added profile needs no list update here.
+    if (!this.promptsLoaded) {
+      this.loadPrompts();
+    }
+    return this.prompts.has(this.normalizeSkillName(skillName));
   }
 
   /**
@@ -332,7 +323,7 @@ STRICT REQUIREMENTS:
    * @returns {Array<string>} Array of skill names that require programming language
    */
   getSkillsRequiringProgrammingLanguage() {
-    return [...this.skillsRequiringProgrammingLanguage];
+    return this.getAvailableSkills();
   }
 
   /**
@@ -416,7 +407,7 @@ STRICT REQUIREMENTS:
       skillsUsedInSession: this.skillPromptSent.size,
       availableSkills: this.getAvailableSkills(),
       skillsUsed: Array.from(this.skillPromptSent),
-      skillsRequiringProgrammingLanguage: this.skillsRequiringProgrammingLanguage
+      skillsRequiringProgrammingLanguage: this.getSkillsRequiringProgrammingLanguage()
     };
 
     return stats;

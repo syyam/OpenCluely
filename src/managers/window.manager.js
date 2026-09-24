@@ -35,6 +35,15 @@ class WindowManager {
     this.bindWindows = true; // Enable window binding by default
     this.windowGap = 10; // Small gap between windows
     this.boundWindowsPosition = { x: 0, y: 0 }; // Track position of bound windows
+
+    // Set once the user drags either bound window; once true, automatic
+    // repositioning (positionBoundWindows/centerWindow) becomes a no-op so a
+    // manually-placed window is never silently recentered by a new response,
+    // loading state, or screen change. _programmaticMove distinguishes our
+    // own setPosition() calls from genuine user drags in the 'move' handlers
+    // below (see attachWindowMoveSync) - only resets on app restart.
+    this._userMovedWindows = false;
+    this._programmaticMove = false;
     
     this.windowConfigs = {
       main: {
@@ -735,9 +744,17 @@ class WindowManager {
   positionBoundWindows() {
     const mainWindow = this.windows.get('main');
     const llmWindow = this.windows.get('llmResponse');
-    
+
     if (!mainWindow || !llmWindow) return;
-    
+
+    if (this._userMovedWindows) {
+      // User-selected position always wins - a new response, loading state,
+      // or screen change must never silently recenter a manually-placed
+      // window. Only resizing (expandLLMWindow's setSize) still happens.
+      logger.debug('Skipping positionBoundWindows: user has manually moved the windows');
+      return;
+    }
+
     const display = this.currentDisplay || screen.getPrimaryDisplay();
     const { x: displayX, y: displayY, width: screenWidth, height: screenHeight } = display.workArea;
     
@@ -761,13 +778,17 @@ class WindowManager {
     // Position main window (top)
     const mainX = adjustedMainX;
     const mainY = startY;
+    // Guard against the 'move' handlers in attachWindowMoveSync mistaking
+    // these programmatic setPosition calls for a user drag.
+    this._programmaticMove = true;
     mainWindow.setPosition(mainX, mainY);
-    
+
     // Position LLM response window below with gap
     const llmX = adjustedLlmX;
     const llmY = startY + mainHeight + this.windowGap;
     llmWindow.setPosition(llmX, llmY);
-    
+    setImmediate(() => { this._programmaticMove = false; });
+
     // Update stored position (use main window position as reference)
     this.boundWindowsPosition = { x: adjustedMainX, y: startY };
     
@@ -963,6 +984,9 @@ class WindowManager {
     // is still up and is dropped instead of ping-ponging back and forth.
     mainWindow.on('move', () => {
       if (this._syncingWindowMove || !this.bindWindows) return;
+      if (!this._programmaticMove) {
+        this._userMovedWindows = true;
+      }
       const llm = this.windows.get('llmResponse');
       if (!llm || llm.isDestroyed()) return;
       this._syncingWindowMove = true;
@@ -978,6 +1002,9 @@ class WindowManager {
 
     llmWindow.on('move', () => {
       if (this._syncingWindowMove || !this.bindWindows) return;
+      if (!this._programmaticMove) {
+        this._userMovedWindows = true;
+      }
       const main = this.windows.get('main');
       if (!main || main.isDestroyed()) return;
       this._syncingWindowMove = true;
@@ -1512,16 +1539,23 @@ class WindowManager {
   }
 
   centerWindow(window) {
+    if (this._userMovedWindows) {
+      logger.debug('Skipping centerWindow: user has manually moved the windows');
+      return;
+    }
+
     const display = this.currentDisplay || screen.getPrimaryDisplay();
     const { x: displayX, y: displayY, width: screenWidth, height: screenHeight } = display.workArea || display.workAreaSize;
     const [windowWidth, windowHeight] = window.getSize();
-    
+
     // Center horizontally but position at top
     const topMargin = 20;
     const x = displayX + Math.round((screenWidth - windowWidth) / 2);
     const y = displayY + topMargin;
-    
+
+    this._programmaticMove = true;
     window.setPosition(x, y);
+    setImmediate(() => { this._programmaticMove = false; });
     
     logger.debug('Positioned window at top-center', {
       position: `${x},${y}`,
