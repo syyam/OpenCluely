@@ -196,14 +196,31 @@ class SessionManager {
     const conversationEvents = this.sessionMemory
       .filter(event => event.role !== 'system' || !event.metadata?.isInitialization)
       .slice(-maxEntries);
-    
+
     return conversationEvents.map(event => ({
       role: event.role,
       content: event.content,
       timestamp: event.timestamp,
       skill: event.skill,
-      action: event.action
+      action: event.action,
+      latestCode: event.metadata?.latestCode || null
     }));
+  }
+
+  /**
+   * Attach a newer version of an answer's code (an Optimized / converted /
+   * Deep-reasoning-improved solution) to that answer's model event, replacing
+   * any earlier one. The expansion itself is not added as a turn — see
+   * LLMService._historyContents for how this is used.
+   * @param {string} eventId - id returned by addModelResponse
+   * @param {{mode: string, code: string}} latestCode
+   * @returns {boolean} false when the event is no longer in memory
+   */
+  setLatestCode(eventId, latestCode) {
+    const event = this.sessionMemory.find(e => e.id === eventId && e.role === 'model');
+    if (!event) return false;
+    event.metadata = { ...event.metadata, latestCode };
+    return true;
   }
 
   /**

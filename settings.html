@@ -311,6 +311,15 @@
                             <option value="javascript">JavaScript</option>
                         </select>
                     </div>
+                    <div class="settings-item">
+                        <div>
+                            <div class="settings-item-label">Framework</div>
+                            <div class="settings-item-description">Used only when an answer needs code; options follow the resume profile</div>
+                        </div>
+                        <select class="input-field" id="codingFramework">
+                            <option value="auto">Auto</option>
+                        </select>
+                    </div>
                 </div>
             </div>
 
@@ -365,7 +374,7 @@
                     <div class="settings-item" style="flex-direction: column; align-items: stretch; gap: 8px;">
                         <div>
                             <div class="settings-item-label">Personal / Interview Notes</div>
-                            <div class="settings-item-description">Self-introduction, visa/work-authorization status, relocation, reason for leaving your current role. Always included regardless of which resume profile is active.</div>
+                            <div class="settings-item-description">Self-introduction, visa/work-authorization status, relocation, reason for leaving your current role. Only sent while Japanese mode is on, for any resume profile.</div>
                         </div>
                         <textarea class="input-field" id="interviewMetadata" rows="8" style="max-width: none; width: 100%; resize: vertical; font-family: inherit;" placeholder="e.g.&#10;My engineering visa is valid until...&#10;I currently live in...&#10;I'm leaving my current role because..."></textarea>
                     </div>
@@ -524,7 +533,8 @@
                             <div class="settings-item-description">Flash-Lite is fast and stays within the free tier for most sessions. Pro gives deeper reasoning for harder mock interviews but uses paid quota sooner.</div>
                         </div>
                         <select class="input-field" id="geminiModel">
-                            <option value="gemini-3.1-flash-lite">Flash-Lite (default, free-tier friendly)</option>
+                            <option value="gemini-3.5-flash-lite">Flash-Lite 3.5 (default, fastest)</option>
+                            <option value="gemini-3.1-flash-lite">Flash-Lite 3.1</option>
                             <option value="gemini-3.1-pro">Pro (deep reasoning)</option>
                         </select>
                     </div>

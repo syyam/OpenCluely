@@ -47,7 +47,8 @@ class WhisperWorkerService {
       model: options.model || 'small',
       language: options.language || 'auto',
       model_dir: options.modelDir || null,
-      device: options.device || 'auto'
+      device: options.device || 'auto',
+      prompt: options.prompt || null
     });
   }
 

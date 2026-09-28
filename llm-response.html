@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OpenCluely</title>
     <script src="lib/markdown.js"></script>
+    <script src="lib/mdtable.js"></script>
     <script src="lib/mathrender.js"></script>
     <!-- PrismJS theme + line-numbers plugin theme for syntax-highlighted,
          line-numbered code blocks (mirrors chat.html's working setup —
@@ -74,6 +75,12 @@
             padding: 0;
             color: #e5e7eb;
         }
+        .md-table-wrap { overflow-x: auto; margin: 0.6rem 0 0.9rem; }
+        .md-table { width: 100%; border-collapse: collapse; font-size: 0.85em; color: #e5e7eb; }
+        .md-table th, .md-table td { border: 1px solid rgba(255, 255, 255, 0.12); padding: 0.3rem 0.5rem; text-align: left; vertical-align: top; }
+        .md-table th { background: rgba(96, 165, 250, 0.15); color: #bfdbfe; font-weight: 600; }
+        .md-table td:first-child { font-weight: 600; color: #fff; }
+        .md-table code { font-size: 0.95em; }
         .markdown-content blockquote {
             border-left: 4px solid #6b7280;
             padding-left: 1rem;
@@ -165,10 +172,33 @@
         .entry-text { min-width: 0; }
         .entry-code { min-width: 0; }
 
+        /* Coding answers with "### Solution N — …" headings: one section
+           per solution. The heading is full width, then that solution's
+           whole explanation (left) and its code (right) start on the same
+           line. Sections are separated by a divider line. */
+        .solution-section { margin-top: 0.75rem; }
+        .solution-section + .solution-section {
+            margin-top: 1.25rem;
+            padding-top: 0.9rem;
+            border-top: 1px solid rgba(255, 255, 255, 0.14);
+        }
+        .solution-header {
+            font-weight: 600;
+            font-size: 0.95rem;
+            color: #93c5fd;
+            border-left: 3px solid rgba(96, 165, 250, 0.6);
+            padding-left: 0.5rem;
+            margin-bottom: 0.6rem;
+        }
+        .solution-section .entry-body.has-code .entry-text > :first-child { margin-top: 0; }
+
         /* "More details": a button under each finished answer, and the
            expansion rendered as an indented row directly below its answer. */
         .entry-footer {
             margin-top: 0.5rem;
+            display: flex;
+            flex-wrap: wrap; /* format-conversion buttons can add up to 4 more */
+            gap: 6px;
         }
         .more-details-btn {
             background: rgba(255,255,255,0.06);
@@ -231,6 +261,59 @@
         .code-content code {
             background-color: transparent;
             color: #e5e7eb;
+        }
+
+        /* Code column: long lines soft-wrap instead of overflowing the half-
+           width column (no sideways scrolling), and the font scales with the
+           column's own width so it stays readable as the window resizes.
+           Prism's theme forces white-space: pre, hence the attribute
+           selectors. The line-numbers plugin detects pre-wrap and keeps each
+           number aligned with its (possibly wrapped) line. */
+        .entry-code {
+            container-type: inline-size;
+        }
+        .code-content {
+            padding: 0.75rem;
+        }
+        .code-content pre,
+        .code-content pre code,
+        .code-content pre[class*="language-"],
+        .code-content code[class*="language-"] {
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            word-break: normal;
+            font-size: clamp(11px, 1.6cqi + 5px, 13.5px);
+            line-height: 1.55;
+            tab-size: 2;
+        }
+        /* Lines wrap (above), so the code panel never scrolls on its own:
+           drop the Prism theme's overflow:auto / margin / background. */
+        .code-content,
+        .code-content pre[class*="language-"] {
+            overflow: hidden;
+        }
+        .code-content pre[class*="language-"] {
+            margin: 0;
+            background: transparent;
+            padding-top: 0;
+            padding-right: 0;
+            padding-bottom: 0;
+        }
+        .code-content::-webkit-scrollbar,
+        .code-content pre::-webkit-scrollbar {
+            display: none;
+        }
+
+        /* ```text blocks in the explanation (Example flow, diagrams): keep
+           every line break, in a compact monospace. */
+        .markdown-content pre.text-block {
+            margin: 0.6rem 0 0.9rem;
+            padding: 0.7rem 0.9rem;
+        }
+        .markdown-content pre.text-block code {
+            white-space: pre;
+            font-size: 0.82rem;
+            line-height: 1.55;
         }
 
         /* Loading state — a small corner badge, NOT a full-window takeover.
@@ -642,6 +725,15 @@
                         }
                     });
                 }
+                if (typeof window.electronAPI.onTranscriptionLlmResponseReset === 'function') {
+                    window.electronAPI.onTranscriptionLlmResponseReset((event, data) => {
+                        try {
+                            handleStreamReset(data && typeof data === 'object' ? data : {});
+                        } catch (err) {
+                            console.error('[LLM-RESPONSE] Error handling stream reset:', err);
+                        }
+                    });
+                }
 
                 // Listen for LLM response
                 window.electronAPI.onDisplayLlmResponse(function() {
@@ -668,7 +760,11 @@
                             return;
                         }
 
-                        hideLoadingState();
+                        // An expansion (Deep reasoning, …) finishing must not
+                        // clear the badge of a new question still loading.
+                        if (!(actualData.metadata && actualData.metadata.parentMessageId)) {
+                            hideLoadingState();
+                        }
                         displayResponse(actualData);
                         setupScrolling();
                         setTimeout(verifyDisplayState, 500);
@@ -713,13 +809,52 @@
             }
         }
 
+        function renderMarkdownInline(text) {
+            if (typeof marked !== 'undefined' && typeof marked.parseInline === 'function') {
+                return marked.parseInline(text);
+            }
+            return escapeHtml(text.replace(/\*\*|__/g, ''));
+        }
+
+        // lib/markdown.js has no ``` fence support, so a ```text block left
+        // in the prose (Example flow, text diagrams) would collapse into one
+        // paragraph. Fenced blocks are rendered as <pre> here, line breaks
+        // intact; everything else goes through renderMarkdownPlain unchanged.
         function renderMarkdown(text) {
+            if (typeof marked !== 'undefined' || !/(^|\n)\s*(```|~~~)/.test(text)) {
+                return renderMarkdownPlain(text);
+            }
+            const fence = /(^|\n)[ \t]*(```|~~~)[^\n]*\n([\s\S]*?)\n[ \t]*\2[ \t]*(?=\n|$)/g;
+            let html = '';
+            let cursor = 0;
+            let m;
+            while ((m = fence.exec(text)) !== null) {
+                const before = text.slice(cursor, m.index + m[1].length);
+                if (before.trim()) html += renderMarkdownPlain(before);
+                html += `<pre class="text-block"><code>${escapeHtml(dedent(m[3]))}</code></pre>`;
+                cursor = fence.lastIndex;
+            }
+            const rest = text.slice(cursor);
+            if (rest.trim()) html += renderMarkdownPlain(rest);
+            return html;
+        }
+
+        // Strip the indentation shared by every line (a fence nested in a
+        // list item arrives indented).
+        function dedent(code) {
+            const lines = code.split('\n');
+            const indents = lines.filter(l => l.trim()).map(l => l.match(/^[ \t]*/)[0].length);
+            const min = indents.length ? Math.min(...indents) : 0;
+            return min ? lines.map(l => l.slice(min)).join('\n') : code;
+        }
+
+        function renderMarkdownPlain(text) {
             if (typeof marked !== 'undefined') {
                 return marked.parse ? marked.parse(text) : marked(text);
             }
 
             if (typeof markdown !== 'undefined' && typeof markdown.toHTML === 'function') {
-                return markdown.toHTML(text);
+                return window.renderWithTables ? window.renderWithTables(text, t => markdown.toHTML(t)) : markdown.toHTML(text);
             }
 
             return escapeHtml(text).replace(/\n/g, '<br>');
@@ -781,7 +916,7 @@
         // parse per chunk — too expensive to redo on every delta); it gets
         // replaced wholesale by the fully-parsed version once the final
         // display-llm-response event lands (see displayResponse).
-        function createLiveEntry(messageId, index, parentMessageId) {
+        function createLiveEntry(messageId, index, parentMessageId, mode) {
             const entry = document.createElement('div');
             entry.className = parentMessageId ? 'response-entry expansion' : 'response-entry';
             entry.dataset.responseIndex = String(index);
@@ -790,7 +925,7 @@
 
             const divider = document.createElement('div');
             divider.className = 'entry-divider';
-            divider.innerHTML = `<span>${entryLabel(index, !!parentMessageId)}</span><span>${new Date().toLocaleTimeString()}</span>`;
+            divider.innerHTML = `<span>${entryLabel(index, parentMessageId ? mode : null)}</span><span>${new Date().toLocaleTimeString()}</span>`;
             entry.appendChild(divider);
 
             const body = document.createElement('div');
@@ -801,11 +936,36 @@
             textEl.className = 'markdown-content entry-text';
             body.appendChild(textEl);
 
-            return { rowEl: entry, textBodyEl: textEl, messageId, parentMessageId: parentMessageId || null, index, pendingDelta: '', flushTimer: null };
+            return { rowEl: entry, textBodyEl: textEl, messageId, parentMessageId: parentMessageId || null, mode: mode || null, index, pendingDelta: '', flushTimer: null };
         }
 
-        function entryLabel(index, isExpansion) {
-            return isExpansion ? `#${index} · More details` : `#${index}`;
+        // Expansions offered under a finished answer: "More details" and
+        // "Deep reasoning" for any answer, "Optimized solution" for answers
+        // with code, and one 'convert:<format id>' button per code format
+        // main offers for it (meta.formats). Each has its own button, row
+        // label and button states.
+        const EXPANSIONS = {
+            details: { title: 'More details', button: 'More details', loading: 'Loading more details…', done: 'Details shown below ↓', retry: 'Retry more details', unavailable: 'Details unavailable' },
+            deep: { title: 'Deep reasoning', button: 'Deep reasoning', loading: 'Reasoning deeply…', done: 'Deep reasoning shown below ↓', retry: 'Retry deep reasoning', unavailable: 'Deep reasoning unavailable' },
+            optimized: { title: 'Optimized', button: 'Optimized solution', loading: 'Optimizing…', done: 'Optimized shown below ↓', retry: 'Retry optimized', unavailable: 'Optimized unavailable' }
+        };
+        // format id -> label, filled from meta.formats as buttons are built.
+        const formatLabels = new Map();
+
+        function expansionMode(mode) {
+            return (EXPANSIONS[mode] || String(mode || '').startsWith('convert:')) ? mode : 'details';
+        }
+
+        function expansionInfo(mode) {
+            mode = expansionMode(mode);
+            if (EXPANSIONS[mode]) return EXPANSIONS[mode];
+            const label = formatLabels.get(mode.slice(8)) || mode.slice(8);
+            return { title: label, button: label, loading: 'Converting…', done: `${label} shown below ↓`, retry: `Retry ${label}`, unavailable: `${label} unavailable` };
+        }
+
+        // mode: null for a normal answer, else the expansion mode.
+        function entryLabel(index, mode) {
+            return mode ? `#${index} · ${expansionInfo(mode).title}` : `#${index}`;
         }
 
         function findRowByMessageId(messageId) {
@@ -851,82 +1011,94 @@
                     document.getElementById('entries').appendChild(rowEl);
                     return;
                 }
-                parentRow.after(rowEl);
+                // After the parent's existing expansions (and theirs — a
+                // converted solution can have its own), so rows stack in the
+                // order they were clicked and stay under the row they belong to.
+                const family = new Set([parentMessageId]);
+                let anchor = parentRow;
+                while (anchor.nextElementSibling && family.has(anchor.nextElementSibling.dataset.parentMessageId)) {
+                    anchor = anchor.nextElementSibling;
+                    if (anchor.dataset.messageId) family.add(anchor.dataset.messageId);
+                }
+                anchor.after(rowEl);
             });
         }
 
-        function setMoreDetailsButtonState(parentMessageId, state) {
+        function setMoreDetailsButtonState(parentMessageId, state, mode) {
+            mode = expansionMode(mode);
             const parentRow = findRowByMessageId(parentMessageId);
-            const btn = parentRow && parentRow.querySelector('.more-details-btn');
+            const btn = parentRow && parentRow.querySelector(`.more-details-btn[data-mode="${mode}"]`);
             if (!btn) return;
-            const states = {
-                loading: ['Loading more details…', true],
-                done: ['Details shown below ↓', true],
-                retry: ['Retry more details', false],
-                unavailable: ['Details unavailable', true]
-            };
-            const [label, disabled] = states[state] || ['More details', false];
-            btn.textContent = label;
-            btn.disabled = disabled;
+            const labels = expansionInfo(mode);
+            const disabled = { loading: true, done: true, retry: false, unavailable: true };
+            btn.textContent = labels[state] || labels.button;
+            btn.disabled = !!disabled[state];
         }
 
-        // parentMessageId -> 'loading' | 'done'; blocks repeated clicks
-        // locally, on top of main's own duplicate check.
+        // "parentMessageId:mode" -> 'loading' | 'done'; blocks repeated
+        // clicks locally, on top of main's own duplicate check.
         const moreDetailsState = new Map();
 
-        function requestMoreDetails(parentMessageId) {
-            if (!parentMessageId || moreDetailsState.has(parentMessageId)) return;
+        function requestMoreDetails(parentMessageId, mode) {
+            mode = expansionMode(mode);
+            const key = `${parentMessageId}:${mode}`;
+            if (!parentMessageId || moreDetailsState.has(key)) return;
             if (!window.electronAPI || typeof window.electronAPI.requestMoreDetails !== 'function') return;
-            moreDetailsState.set(parentMessageId, 'loading');
-            setMoreDetailsButtonState(parentMessageId, 'loading');
-            window.electronAPI.requestMoreDetails(parentMessageId).then((result) => {
+            moreDetailsState.set(key, 'loading');
+            setMoreDetailsButtonState(parentMessageId, 'loading', mode);
+            window.electronAPI.requestMoreDetails(parentMessageId, mode).then((result) => {
                 if (result && result.ok) return;
                 if (result && result.reason === 'unavailable') {
-                    setMoreDetailsButtonState(parentMessageId, 'unavailable');
+                    setMoreDetailsButtonState(parentMessageId, 'unavailable', mode);
                 }
                 // 'duplicate': an expansion is already running/done — keep
                 // the button disabled in its current state.
             }).catch((err) => {
-                console.error('[LLM-RESPONSE] More details request failed:', err);
-                moreDetailsState.delete(parentMessageId);
-                setMoreDetailsButtonState(parentMessageId, 'retry');
+                console.error('[LLM-RESPONSE] Expansion request failed:', err);
+                moreDetailsState.delete(key);
+                setMoreDetailsButtonState(parentMessageId, 'retry', mode);
             });
         }
 
         function handleMoreDetailsFailed(data) {
             if (!data || !data.parentMessageId) return;
+            const mode = expansionMode(data.mode);
             const live = data.messageId && liveEntries.get(data.messageId);
             if (live) {
                 if (live.flushTimer) clearTimeout(live.flushTimer);
                 withViewportPreserved(() => live.rowEl.remove());
                 liveEntries.delete(data.messageId);
             }
-            moreDetailsState.delete(data.parentMessageId);
-            setMoreDetailsButtonState(data.parentMessageId, 'retry');
+            moreDetailsState.delete(`${data.parentMessageId}:${mode}`);
+            setMoreDetailsButtonState(data.parentMessageId, 'retry', mode);
         }
 
         function handleStreamStart(data) {
             if (!data || !data.messageId) return;
 
-            // Content is now visibly appearing — the "Analyzing..." badge
-            // would otherwise sit redundantly over live-streaming text.
-            hideLoadingState();
-
             const responseElement = document.getElementById('response-content');
             if (responseElement) responseElement.classList.remove('hidden');
 
             if (data.parentMessageId) {
-                // "More details" expansion: indented row under its parent,
-                // numbered like the parent, no scroll / no pill.
+                // "More details" / "Optimized" expansion: indented row under
+                // its parent, numbered like the parent, no scroll / no pill.
+                const mode = expansionMode(data.mode);
                 const parentRow = findRowByMessageId(data.parentMessageId);
                 const parentIndex = parentRow ? Number(parentRow.dataset.responseIndex) || 0 : 0;
-                const live = createLiveEntry(data.messageId, parentIndex, data.parentMessageId);
+                const live = createLiveEntry(data.messageId, parentIndex, data.parentMessageId, mode);
                 liveEntries.set(data.messageId, live);
                 insertExpansionRow(live.rowEl, data.parentMessageId);
-                moreDetailsState.set(data.parentMessageId, 'loading');
-                setMoreDetailsButtonState(data.parentMessageId, 'loading');
+                moreDetailsState.set(`${data.parentMessageId}:${mode}`, 'loading');
+                setMoreDetailsButtonState(data.parentMessageId, 'loading', mode);
+                // No hideLoadingState() here: an expansion never shows the
+                // "Analyzing..." badge, and it may be running in parallel
+                // with a new question whose badge must stay up.
                 return;
             }
+
+            // Content is now visibly appearing — the "Analyzing..." badge
+            // would otherwise sit redundantly over live-streaming text.
+            hideLoadingState();
 
             responseIndex += 1;
             const live = createLiveEntry(data.messageId, responseIndex);
@@ -979,6 +1151,26 @@
             }, STREAM_FLUSH_MS);
         }
 
+        // A streamed attempt broke off mid-answer (e.g. Gemini's mid-stream
+        // 503) and main is retrying on the next model: drop the partial text
+        // so the retry streams into an empty row instead of after half an
+        // answer.
+        function handleStreamReset(data) {
+            if (!data || !data.messageId) return;
+            const entry = liveEntries.get(data.messageId);
+            if (!entry) return;
+            if (entry.flushTimer) {
+                clearTimeout(entry.flushTimer);
+                entry.flushTimer = null;
+            }
+            entry.pendingDelta = '';
+            if (entry.parentMessageId) {
+                withViewportPreserved(() => { entry.textBodyEl.textContent = ''; });
+            } else {
+                entry.textBodyEl.textContent = '';
+            }
+        }
+
         // Builds one complete, fully-parsed `.response-entry` row (text +,
         // when present, a code column) for a finished answer. Pure — does
         // not touch the DOM outside the node it returns. `meta` carries the
@@ -999,81 +1191,105 @@
 
             const divider = document.createElement('div');
             divider.className = 'entry-divider';
-            divider.innerHTML = `<span>${entryLabel(index, isExpansion)}</span><span>${new Date().toLocaleTimeString()}</span>`;
+            divider.innerHTML = `<span>${entryLabel(index, isExpansion ? meta.expansionMode : null)}</span><span>${new Date().toLocaleTimeString()}</span>`;
             entry.appendChild(divider);
 
-            // One row per code block: the explanation written right before
-            // that block on the left, the block itself on the right — so
-            // "Implementation" sits beside its code and "Optimized solution"
-            // beside its own. Text after the last block is a full-width row.
-            const segments = [];
-            let cursor = 0;
-            codeBlocks.forEach(block => {
-                segments.push({ text: response.slice(cursor, block.index), block });
-                cursor = block.index + block.fullMatch.length;
-            });
-            segments.push({ text: response.slice(cursor), block: null });
+            // Coding answers with "### Solution N — …" sections: each
+            // solution gets a full-width heading, then ALL of its prose
+            // (approach, details, complexity) on the left beside its own
+            // code on the right. Nothing from one solution flows next to
+            // another solution's code.
+            const { preamble, sections } = splitSolutionSections(response);
+            const sectionsHaveCode = sections.some(s => realCodeBlocks(s.body).length > 0);
+            if (sections.length && sectionsHaveCode) {
+                appendTextRow(entry, preamble);
+                sections.forEach(section => {
+                    const sectionEl = document.createElement('div');
+                    sectionEl.className = 'solution-section';
+                    const header = document.createElement('div');
+                    header.className = 'solution-header markdown-content';
+                    header.innerHTML = renderMarkdownInline(section.heading);
+                    sectionEl.appendChild(header);
 
-            segments.forEach(seg => {
-                const segText = seg.text.replace(/\n\s*\n\s*\n/g, '\n\n').trim();
-                if (!segText && !seg.block) return;
-
-                const body = document.createElement('div');
-                body.className = seg.block ? 'entry-body has-code' : 'entry-body no-code';
-                entry.appendChild(body);
-
-                const textEl = document.createElement('div');
-                textEl.className = 'markdown-content entry-text';
-                textEl.innerHTML = renderMarkdown(segText);
-                body.appendChild(textEl);
-                if (window.renderMathInElement) window.renderMathInElement(textEl);
-
-                if (!seg.block) return;
-                const block = seg.block;
-                const codeEl = document.createElement('div');
-                codeEl.className = 'entry-code';
-
-                const codeBlock = document.createElement('div');
-                codeBlock.className = 'code-block';
-                codeBlock.innerHTML = `
-                    <div class="code-header">${block.language.toUpperCase()}</div>
-                    <div class="code-content">
-                        <pre class="line-numbers"><code class="language-${block.language}">${escapeHtml(block.code)}</code></pre>
-                    </div>
-                `;
-                const pre = codeBlock.querySelector('pre');
-                pre.style.position = 'relative';
-                const btn = document.createElement('button');
-                btn.className = 'copy-btn';
-                btn.textContent = 'Copy';
-                attachCopy(btn, block.code || '');
-                pre.appendChild(btn);
-                codeEl.appendChild(codeBlock);
-                body.appendChild(codeEl);
-
-                if (typeof Prism !== 'undefined') {
-                    if (typeof Prism.highlightAllUnder === 'function') {
-                        Prism.highlightAllUnder(codeEl);
+                    const blocks = realCodeBlocks(section.body);
+                    if (!blocks.length) {
+                        appendTextRow(sectionEl, section.body);
                     } else {
-                        Prism.highlightAll();
+                        let prose = '';
+                        let cursor = 0;
+                        blocks.forEach(b => {
+                            prose += section.body.slice(cursor, b.index) + '\n\n';
+                            cursor = b.index + b.fullMatch.length;
+                        });
+                        prose += section.body.slice(cursor);
+                        const body = appendTextRow(sectionEl, prose, true);
+                        const codeEl = document.createElement('div');
+                        codeEl.className = 'entry-code';
+                        blocks.forEach(b => codeEl.appendChild(buildCodeBlockEl(b)));
+                        body.appendChild(codeEl);
+                        highlightUnder(codeEl);
                     }
+                    entry.appendChild(sectionEl);
+                });
+            } else {
+                // One row per code block: the explanation written right
+                // before that block on the left, the block itself on the
+                // right. Text after the last block (implementation details,
+                // complexity, example flow…) joins the last block's row so
+                // it stays beside that code; with no code it's full width.
+                const segments = [];
+                let cursor = 0;
+                codeBlocks.forEach(block => {
+                    segments.push({ text: response.slice(cursor, block.index), block });
+                    cursor = block.index + block.fullMatch.length;
+                });
+                const trailing = response.slice(cursor);
+                if (segments.length) {
+                    segments[segments.length - 1].text += '\n\n' + trailing;
+                } else {
+                    segments.push({ text: trailing, block: null });
                 }
-            });
 
-            // "More details" — only on a real finished answer (not on a
-            // fallback "could you repeat" reply, and not on an expansion).
-            if (meta.messageId && !meta.usedFallback && !isExpansion) {
+                segments.forEach(seg => {
+                    const body = appendTextRow(entry, seg.text, !!seg.block);
+                    if (!body || !seg.block) return;
+                    const codeEl = document.createElement('div');
+                    codeEl.className = 'entry-code';
+                    codeEl.appendChild(buildCodeBlockEl(seg.block));
+                    body.appendChild(codeEl);
+                    highlightUnder(codeEl);
+                });
+            }
+
+            // "More details" | "Deep reasoning" (+ "Optimized solution" when
+            // the answer has code) — only on a real finished answer (not on a
+            // fallback "could you repeat" reply). Of the expansions, only a
+            // converted solution gets them (it's a full answer in another
+            // format).
+            const isConverted = isExpansion && String(meta.expansionMode || '').startsWith('convert:');
+            if (meta.messageId && !meta.usedFallback && (!isExpansion || isConverted)) {
                 const footer = document.createElement('div');
                 footer.className = 'entry-footer';
-                const btn = document.createElement('button');
-                btn.className = 'more-details-btn';
-                btn.type = 'button';
-                btn.textContent = 'More details';
-                btn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    requestMoreDetails(meta.messageId);
+                const modes = hasCodeLocal ? ['details', 'deep', 'optimized'] : ['details', 'deep'];
+                if (hasCodeLocal && Array.isArray(meta.formats)) {
+                    meta.formats.forEach(f => {
+                        if (!f || !f.id) return;
+                        formatLabels.set(f.id, f.label || f.id);
+                        modes.push(`convert:${f.id}`);
+                    });
+                }
+                modes.forEach(mode => {
+                    const btn = document.createElement('button');
+                    btn.className = 'more-details-btn';
+                    btn.type = 'button';
+                    btn.dataset.mode = mode;
+                    btn.textContent = expansionInfo(mode).button;
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        requestMoreDetails(meta.messageId, mode);
+                    });
+                    footer.appendChild(btn);
                 });
-                footer.appendChild(btn);
                 entry.appendChild(footer);
             }
 
@@ -1113,6 +1329,7 @@
                     live.flushTimer = null;
                 }
                 const finalNode = buildEntryNode(response, live.index, meta);
+                if (lastResponseRowEl === live.rowEl) lastResponseRowEl = finalNode;
                 if (live.parentMessageId) {
                     withViewportPreserved(() => replaceEntryNode(live.rowEl, finalNode), [live.rowEl, finalNode]);
                 } else {
@@ -1120,8 +1337,9 @@
                 }
                 liveEntries.delete(incomingMessageId);
                 if (meta.parentMessageId) {
-                    moreDetailsState.set(meta.parentMessageId, 'done');
-                    setMoreDetailsButtonState(meta.parentMessageId, 'done');
+                    const mode = expansionMode(meta.expansionMode);
+                    moreDetailsState.set(`${meta.parentMessageId}:${mode}`, 'done');
+                    setMoreDetailsButtonState(meta.parentMessageId, 'done', mode);
                 }
                 return;
             }
@@ -1132,8 +1350,9 @@
                 const parentRow = findRowByMessageId(meta.parentMessageId);
                 const parentIndex = parentRow ? Number(parentRow.dataset.responseIndex) || 0 : 0;
                 insertExpansionRow(buildEntryNode(response, parentIndex, meta), meta.parentMessageId);
-                moreDetailsState.set(meta.parentMessageId, 'done');
-                setMoreDetailsButtonState(meta.parentMessageId, 'done');
+                const mode = expansionMode(meta.expansionMode);
+                moreDetailsState.set(`${meta.parentMessageId}:${mode}`, 'done');
+                setMoreDetailsButtonState(meta.parentMessageId, 'done', mode);
                 return;
             }
 
@@ -1214,6 +1433,123 @@
             return blocks;
         }
 
+        // Code blocks that go to the side column (not ```text diagrams).
+        function realCodeBlocks(text) {
+            return extractCodeBlocks(text).filter(b => !INLINE_FENCE_TAGS.has(b.language.toLowerCase()));
+        }
+
+        // Splits a coding answer at its "## / ### / #### …" heading lines
+        // (one per solution), ignoring anything inside code fences and
+        // dropping standalone "---" separators (sections draw their own).
+        function splitSolutionSections(text) {
+            const preambleLines = [];
+            const sections = [];
+            let current = null;
+            let fence = null;
+            (text || '').split('\n').forEach(line => {
+                const fenceMatch = line.match(/^\s*(```|~~~)/);
+                if (fenceMatch) {
+                    if (!fence) fence = fenceMatch[1];
+                    else if (fence === fenceMatch[1]) fence = null;
+                } else if (!fence) {
+                    // Only a solution heading ("Solution — …", "Optimized —
+                    // …", Deep reasoning's "Improved — …") starts a section.
+                    // Sub-headings the model writes (Approach,
+                    // Implementation, Complexity, Why it works, Example
+                    // flow) stay in that section's left column, beside
+                    // its code.
+                    const heading = line.match(/^\s{0,3}#{2,4}\s+(.+?)\s*#*\s*$/);
+                    if (heading && /^[*_\s]*(solution|optimized|improved)\b/i.test(heading[1])) {
+                        current = { heading: heading[1], lines: [] };
+                        sections.push(current);
+                        return;
+                    }
+                    if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) return;
+                }
+                (current ? current.lines : preambleLines).push(line);
+            });
+            return {
+                preamble: preambleLines.join('\n'),
+                sections: sections.map(s => ({ heading: s.heading, body: s.lines.join('\n') }))
+            };
+        }
+
+        // Appends one explanation row to `parent`. With `withCode`, it's the
+        // two-column grid (caller adds the .entry-code cell) and is created
+        // even with no text; otherwise empty text adds nothing.
+        function appendTextRow(parent, text, withCode = false) {
+            const cleaned = separateListsFromParagraphs(text || '').replace(/\n\s*\n\s*\n/g, '\n\n').trim();
+            if (!cleaned && !withCode) return null;
+            const body = document.createElement('div');
+            body.className = withCode ? 'entry-body has-code' : 'entry-body no-code';
+            const textEl = document.createElement('div');
+            textEl.className = 'markdown-content entry-text';
+            textEl.innerHTML = renderMarkdown(cleaned);
+            body.appendChild(textEl);
+            parent.appendChild(body);
+            if (window.renderMathInElement) window.renderMathInElement(textEl);
+            return body;
+        }
+
+        // lib/markdown.js only starts a list after a blank line, but the
+        // model writes "**Approach**\n1. …" — so insert that blank line
+        // before a list item that directly follows a non-list line.
+        function separateListsFromParagraphs(text) {
+            const listItem = /^\s*(\d+[.)]|[-*+])\s+/;
+            const out = [];
+            let inFence = false;
+            text.split('\n').forEach(line => {
+                if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
+                const prev = out.length ? out[out.length - 1] : '';
+                if (!inFence && listItem.test(line) && prev.trim() && !listItem.test(prev) && !/^\s/.test(prev)) {
+                    out.push('');
+                }
+                out.push(line);
+            });
+            return out.join('\n');
+        }
+
+        // Fence tags the model writes → Prism grammar ids (the autoloader
+        // only knows the canonical ids and its own aliases).
+        const PRISM_LANG_ALIASES = {
+            kt: 'kotlin', kts: 'kotlin', ts: 'typescript', js: 'javascript',
+            py: 'python', sh: 'bash', shell: 'bash', zsh: 'bash', 'c++': 'cpp',
+            'c#': 'csharp', cs: 'csharp', golang: 'go', rb: 'ruby', vue: 'markup',
+            html: 'markup', xml: 'markup', svg: 'markup', yml: 'yaml'
+        };
+        function prismLanguage(tag) {
+            const t = String(tag || '').toLowerCase().replace(/[^\w+#-]/g, '');
+            return PRISM_LANG_ALIASES[t] || t || 'none';
+        }
+
+        function buildCodeBlockEl(block) {
+            const codeBlock = document.createElement('div');
+            codeBlock.className = 'code-block';
+            codeBlock.innerHTML = `
+                <div class="code-header">${escapeHtml(block.language.toUpperCase())}</div>
+                <div class="code-content">
+                    <pre class="line-numbers"><code class="language-${prismLanguage(block.language)}">${escapeHtml(block.code)}</code></pre>
+                </div>
+            `;
+            const pre = codeBlock.querySelector('pre');
+            pre.style.position = 'relative';
+            const btn = document.createElement('button');
+            btn.className = 'copy-btn';
+            btn.textContent = 'Copy';
+            attachCopy(btn, block.code || '');
+            pre.appendChild(btn);
+            return codeBlock;
+        }
+
+        function highlightUnder(el) {
+            if (typeof Prism === 'undefined') return;
+            if (typeof Prism.highlightAllUnder === 'function') {
+                Prism.highlightAllUnder(el);
+            } else {
+                Prism.highlightAll();
+            }
+        }
+
         function attachCopy(btn, text) {
             btn.addEventListener('click', async (e) => {
                 e.stopPropagation();
@@ -1270,9 +1606,20 @@
         (function() {
             const el = document.getElementById('new-response-indicator');
             if (!el) return;
-            el.addEventListener('click', () => {
-                if (lastResponseRowEl) {
-                    lastResponseRowEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                // Resolve the newest answer row at click time. A stored
+                // reference goes stale: the live streaming row is replaced
+                // by its fully-parsed version when the answer finishes, and
+                // scrolling to the detached old node silently does nothing.
+                const rows = document.querySelectorAll('#entries > .response-entry:not(.expansion)');
+                const row = rows.length ? rows[rows.length - 1] : lastResponseRowEl;
+                const sc = getResponseScrollEl();
+                if (row && row.isConnected && sc) {
+                    // Scroll only the response pane (scrollIntoView can also
+                    // shift the overflow:hidden outer containers).
+                    const top = sc.scrollTop + row.getBoundingClientRect().top - sc.getBoundingClientRect().top;
+                    sc.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
                 }
                 hideNewResponseIndicator();
             });
@@ -1385,11 +1732,13 @@
          arriving very early can't race a not-yet-loaded Prism — the
          `typeof Prism !== 'undefined'` guards already in the code handle
          that gracefully either way. -->
-    <script src="./node_modules/prismjs/prism.min.js"></script>
+    <script src="./node_modules/prismjs/prism.js"></script>
     <script src="./node_modules/prismjs/plugins/autoloader/prism-autoloader.min.js"></script>
     <script src="./node_modules/prismjs/plugins/line-numbers/prism-line-numbers.min.js"></script>
     <script>
         try { if (window.Prism && Prism.plugins && Prism.plugins.autoloader) { Prism.plugins.autoloader.languages_path = './node_modules/prismjs/components/'; } } catch (_) {}
+        // Prism has no Vue grammar; highlight ```vue SFC blocks as HTML.
+        try { if (window.Prism && Prism.languages.markup && !Prism.languages.vue) { Prism.languages.vue = Prism.languages.markup; } } catch (_) {}
     </script>
 </body>
 </html>

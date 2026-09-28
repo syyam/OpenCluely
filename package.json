@@ -6,6 +6,9 @@
   "scripts": {
     "start": "env -u ELECTRON_RUN_AS_NODE electron .",
     "dev": "env -u ELECTRON_RUN_AS_NODE electron . --no-sandbox --disable-gpu",
+    "test": "node --test --test-concurrency=4 \"test/**/*.test.js\"",
+    "test:live": "node --test test/live/live.run.js",
+    "test:smoke": "node scripts/smoke-app.js",
     "test-speech": "node scripts/test-speech.js",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
@@ -44,7 +47,8 @@
   },
   "devDependencies": {
     "electron": "^29.1.0",
-    "electron-builder": "^24.13.3"
+    "electron-builder": "^24.13.3",
+    "jsdom": "^30.1.1"
   },
   "build": {
     "appId": "com.opencluely.app",
@@ -55,6 +59,8 @@
     "files": [
       "**/*",
       "!dist/**/*",
+      "!test/**/*",
+      "!scripts/smoke-app.js",
       "!*.md",
       "!.git/**/*",
       "!.env*",
@@ -68,6 +74,7 @@
     "asarUnpack": [
       "assests/icons/**/*",
       "prompts/**/*",
+      "knowledge/**/*",
       "scripts/whisper_worker.py"
     ],
     "mac": {

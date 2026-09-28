@@ -1456,6 +1456,24 @@ class SpeechService extends EventEmitter {
     return this._getSetting('whisperModel') || process.env.WHISPER_MODEL || config.get('speech.whisper.model') || 'small';
   }
 
+  /**
+   * Set by main.js: returns the vocabulary hint for the active profile and
+   * framework (src/core/speech-vocab.js). Without it the worker falls back to
+   * its built-in term list.
+   */
+  setWhisperPromptProvider(provider) {
+    this.whisperPromptProvider = typeof provider === 'function' ? provider : null;
+  }
+
+  _getWhisperPrompt() {
+    try {
+      return this.whisperPromptProvider ? this.whisperPromptProvider() || null : null;
+    } catch (error) {
+      logger.warn('Whisper prompt provider failed', { error: error.message });
+      return null;
+    }
+  }
+
   _getWhisperModelDir() {
     const configured = this._getSetting('whisperModelDir') || process.env.WHISPER_MODEL_DIR || '';
     // Honor an absolute configured dir. Empty or relative values (the old
@@ -2155,6 +2173,14 @@ class SpeechService extends EventEmitter {
       return 'repetition';
     }
 
+    // Keyboard clicks and other short noise come back as bare function words
+    // ("and the", "The", "and the the the…") or "Clip" — seen 2026-09-26/27.
+    // A transcript made only of these words carries no question.
+    const FILLER_WORDS = new Set(['and', 'the', 'a', 'an', 'of', 'to', 'in', 'on', 'or', 'but', 'clip', 'um', 'uh', 'hmm', 'mm', 'mhm']);
+    if (normalized.split(' ').every((w) => FILLER_WORDS.has(w))) {
+      return 'filler';
+    }
+
     // 'ja' is only a legitimate transcript language while Japanese response
     // mode is on — otherwise it's the same class of noise-misdetection as
     // any other non-English language (see class doc above).
@@ -2162,7 +2188,15 @@ class SpeechService extends EventEmitter {
       ? new Set(['en', 'ja'])
       : new Set(['en']);
     if (detectedLanguage && !allowedLanguages.has(String(detectedLanguage).toLowerCase())) {
-      return `language:${detectedLanguage}`;
+      // Whisper often mislabels short English questions with a misheard word
+      // or two ("Can you tell me about the Compose, Pé?" came back as
+      // Icelandic). Keep them when most words are plain ASCII; real foreign
+      // text or noise ("и т.д.", "Telni varða kompóðið") stays dropped.
+      const words = normalized.split(' ');
+      const asciiWords = words.filter((w) => /^[a-z0-9']+$/.test(w)).length;
+      if (!(words.length >= 3 && asciiWords / words.length >= 0.7)) {
+        return `language:${detectedLanguage}`;
+      }
     }
 
     // High no_speech_prob means Whisper itself judged this segment as
@@ -2241,7 +2275,8 @@ class SpeechService extends EventEmitter {
           model: this._getWhisperModel(),
           language: this._getWhisperLanguage(),
           modelDir: this._getWhisperModelDir(),
-          device: this._getWhisperDevice()
+          device: this._getWhisperDevice(),
+          prompt: this._getWhisperPrompt()
         });
         const totalMs = Date.now() - startedAt;
         const inferenceMs = typeof result.inferenceMs === 'number' ? result.inferenceMs : null;
@@ -2292,6 +2327,11 @@ class SpeechService extends EventEmitter {
 
     if (this._getWhisperModelDir()) {
       args.push('--model_dir', this._getWhisperModelDir());
+    }
+
+    const prompt = this._getWhisperPrompt();
+    if (prompt) {
+      args.push('--initial_prompt', prompt);
     }
 
     try {

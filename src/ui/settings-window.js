@@ -20,6 +20,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const geminiModelSelect = document.getElementById('geminiModel');
     const windowGapInput = document.getElementById('windowGap');
     const codingLanguageSelect = document.getElementById('codingLanguage');
+    const codingFrameworkSelect = document.getElementById('codingFramework');
+
+    // Options depend on the active profile, so they come from main.
+    const fillFrameworkSelect = (options, value) => {
+        if (!codingFrameworkSelect || !Array.isArray(options)) return;
+        codingFrameworkSelect.innerHTML = '';
+        options.forEach(({ id, label }) => codingFrameworkSelect.add(new Option(label, id)));
+        codingFrameworkSelect.value = options.some(o => o.id === value) ? value : 'auto';
+    };
     const iconGrid = document.getElementById('iconGrid');
     const resumeProfileSelect = document.getElementById('resumeProfile');
     const resumeContextInput = document.getElementById('resumeContext');
@@ -95,7 +104,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperResponseTargetSelect) whisperResponseTargetSelect.value = settings.whisperResponseTarget || 'both';
         if (whisperSegmentMsInput) whisperSegmentMsInput.value = settings.whisperSegmentMs || '';
         if (geminiKeyInput) geminiKeyInput.value = settings.geminiKey || '';
-        if (geminiModelSelect) geminiModelSelect.value = settings.geminiModel || 'gemini-3.1-flash-lite';
+        if (geminiModelSelect) geminiModelSelect.value = settings.geminiModel || 'gemini-3.5-flash-lite';
         if (windowGapInput) windowGapInput.value = settings.windowGap || '';
 
         // Set Kotlin as default if no coding language is specified, or if a
@@ -104,6 +113,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const validLanguages = Array.from(codingLanguageSelect.options).map(o => o.value);
             codingLanguageSelect.value = validLanguages.includes(settings.codingLanguage) ? settings.codingLanguage : 'kotlin';
         }
+        fillFrameworkSelect(settings.frameworkOptions, settings.codingFramework);
 
         if (resumeProfileSelect) resumeProfileSelect.value = settings.resumeProfile || 'android';
         if (resumeContextInput) resumeContextInput.value = settings.resumeContext || '';
@@ -144,6 +154,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 console.log('Language updated from overlay window:', data.language);
             }
     });
+
+    if (window.electronAPI.onCodingFrameworkChanged) {
+        window.electronAPI.onCodingFrameworkChanged((event, data) => {
+            if (data) fillFrameworkSelect(data.options, data.framework);
+        });
+    }
 
     // Listen for Japanese-mode changes from the bar button so this select
     // can't drift out of sync with it.
@@ -322,6 +338,16 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 // fallback
                 saveSettings();
+            }
+        });
+    }
+
+    // Framework: saved on its own (not in the bulk saveSettings above) so a
+    // profile switch never re-sends a stale pick from the old profile.
+    if (codingFrameworkSelect) {
+        codingFrameworkSelect.addEventListener('change', (e) => {
+            if (window.electronAPI && window.electronAPI.saveSettings) {
+                window.electronAPI.saveSettings({ codingFramework: e.target.value });
             }
         });
     }

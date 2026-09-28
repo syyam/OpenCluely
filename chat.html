@@ -543,6 +543,50 @@
         pointer-events: none;
         opacity: 0.5;
       }
+      .non-interactive .attachment-strip {
+        pointer-events: none;
+        opacity: 0.5;
+      }
+
+      /* Screenshots attached in the input (paste / file picker), before sending */
+      .attachment-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+      .attachment-strip:empty {
+        display: none;
+      }
+      .attachment-chip {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 4px 3px 3px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 6px;
+        color: rgba(255, 255, 255, 0.9);
+        font-size: 11px;
+      }
+      .attachment-chip img {
+        width: 28px;
+        height: 28px;
+        object-fit: cover;
+        border-radius: 4px;
+      }
+      .attachment-remove {
+        background: none;
+        border: none;
+        color: rgba(255, 255, 255, 0.7);
+        cursor: pointer;
+        font-size: 13px;
+        line-height: 1;
+        padding: 0 3px;
+      }
+      .attachment-remove:hover {
+        color: #ff4757;
+      }
 
       /* Minimalist Listening Animation */
       .listening-indicator {
@@ -671,6 +715,12 @@
           transform: translateY(0);
         }
       }
+      .md-table-wrap { overflow-x: auto; margin: 0.6rem 0 0.9rem; }
+      .md-table { width: 100%; border-collapse: collapse; font-size: 0.85em; color: #e5e7eb; }
+      .md-table th, .md-table td { border: 1px solid rgba(255, 255, 255, 0.12); padding: 0.3rem 0.5rem; text-align: left; vertical-align: top; }
+      .md-table th { background: rgba(96, 165, 250, 0.15); color: #bfdbfe; font-weight: 600; }
+      .md-table td:first-child { font-weight: 600; color: #fff; }
+      .md-table code { font-size: 0.95em; }
     </style>
   </head>
   <body>
@@ -694,13 +744,18 @@
       <div class="chat-messages" id="chatMessages"></div>
 
       <div class="chat-input">
+        <div class="attachment-strip" id="attachmentStrip"></div>
         <div class="input-container">
           <textarea
             class="input-field"
-            placeholder="Type a message… (Shift+Enter for newline)"
+            placeholder="Type a message or paste a screenshot… (Shift+Enter for newline)"
             id="messageInput"
             rows="1"
           ></textarea>
+          <input type="file" id="attachInput" accept="image/png,image/jpeg,image/webp" multiple hidden />
+          <button class="send-button" id="attachButton" title="Attach screenshot(s)">
+            <i class="fas fa-paperclip"></i>
+          </button>
           <button class="mic-button" id="micButton">
             <i class="fas fa-microphone"></i>
           </button>
@@ -711,14 +766,17 @@
       </div>
     </div>
     <script src="lib/markdown.js"></script>
+    <script src="lib/mdtable.js"></script>
     <script src="lib/mathrender.js"></script>
     <!-- PrismJS core and autoloader for language components -->
-    <script src="./node_modules/prismjs/prism.min.js"></script>
+    <script src="./node_modules/prismjs/prism.js"></script>
     <script src="./node_modules/prismjs/plugins/autoloader/prism-autoloader.min.js"></script>
     
     <script>
       // Configure Prism autoloader
       try { if (window.Prism && Prism.plugins && Prism.plugins.autoloader) { Prism.plugins.autoloader.languages_path = './node_modules/prismjs/components/'; } } catch (_) {}
+      // Prism has no Vue grammar; highlight ```vue SFC blocks as HTML.
+      try { if (window.Prism && Prism.languages.markup && !Prism.languages.vue) { Prism.languages.vue = Prism.languages.markup; } } catch (_) {}
     </script>
     <script>
       // Use electronAPI from preload script instead of direct require
@@ -921,7 +979,7 @@
         
         try {
           if (typeof markdown !== 'undefined' && markdown.toHTML) {
-            return markdown.toHTML(text);
+            return window.renderWithTables ? window.renderWithTables(text, t => markdown.toHTML(t)) : markdown.toHTML(text);
           } else {
             console.warn('Markdown library not loaded, falling back to basic formatting');
             return text
@@ -1123,7 +1181,7 @@
         const lang = (language || 'text').toLowerCase();
         const pre = document.createElement('pre');
         const codeEl = document.createElement('code');
-        codeEl.className = `language-${lang}`;
+        codeEl.className = `language-${({ vue: 'markup', html: 'markup', kt: 'kotlin', ts: 'typescript', js: 'javascript', py: 'python', sh: 'bash', 'c++': 'cpp', 'c#': 'csharp' })[lang] || lang.replace(/[^\w-]/g, '')}`;
         codeEl.innerHTML = escapeHtml(code || '');
 
         const copyBtn = document.createElement('button');
@@ -1274,28 +1332,127 @@
         });
       }
 
-      if (sendButton) {
-        sendButton.addEventListener('click', async () => {
-          const text = messageInput.value.trim();
-          if (text) {
-            addMessage(text, 'user');
-            messageInput.value = '';
-            
-            // Show thinking indicator after user message
-            setTimeout(() => {
-              showThinkingIndicator();
-            }, 300);
-            
-            // Send to main process for session memory storage and LLM processing
-            try {
-              if (whysperAPI && whysperAPI.sendChatMessage) {
-                await whysperAPI.sendChatMessage(text);
-              }
-            } catch (error) {
-              console.error('Failed to send chat message to main process:', error);
-            }
-          }
+      // ── Screenshot attachments (paste / file picker) ──
+      // Kept as File objects with object-URL thumbnails (no base64 in the
+      // renderer); the bytes are read once, on send, and go to the same
+      // screenshot-analysis flow as the full-screen hotkey.
+      const ATTACHMENT_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
+      const attachmentStrip = document.getElementById('attachmentStrip');
+      const attachInput = document.getElementById('attachInput');
+      const attachButton = document.getElementById('attachButton');
+      let attachments = []; // [{ file, url }] in attach order
+
+      function renderAttachments() {
+        if (!attachmentStrip) return;
+        attachmentStrip.innerHTML = '';
+        attachments.forEach((att, i) => {
+          const chip = document.createElement('div');
+          chip.className = 'attachment-chip';
+          const img = document.createElement('img');
+          img.src = att.url;
+          img.alt = '';
+          const label = document.createElement('span');
+          label.textContent = `Screenshot ${i + 1}`;
+          const remove = document.createElement('button');
+          remove.className = 'attachment-remove';
+          remove.type = 'button';
+          remove.title = 'Remove';
+          remove.textContent = '×';
+          remove.addEventListener('click', () => {
+            URL.revokeObjectURL(att.url);
+            attachments.splice(attachments.indexOf(att), 1);
+            renderAttachments();
+          });
+          chip.append(img, label, remove);
+          attachmentStrip.appendChild(chip);
         });
+      }
+
+      function addAttachments(files) {
+        let skipped = 0;
+        Array.from(files || []).forEach(file => {
+          if (!file || !ATTACHMENT_TYPES.includes(file.type)) { skipped++; return; }
+          attachments.push({ file, url: URL.createObjectURL(file) });
+        });
+        if (skipped) addMessage('Only PNG, JPEG or WebP images can be attached.', 'system');
+        renderAttachments();
+      }
+
+      function clearAttachments() {
+        attachments.forEach(att => URL.revokeObjectURL(att.url));
+        attachments = [];
+        renderAttachments();
+      }
+
+      if (attachButton && attachInput) {
+        attachButton.addEventListener('click', () => attachInput.click());
+        attachInput.addEventListener('change', () => {
+          addAttachments(attachInput.files);
+          attachInput.value = ''; // allow re-picking the same file
+        });
+      }
+
+      // Ctrl+V of a screenshot (Snipping Tool, Win+Shift+S, …). Text pastes
+      // are left alone.
+      if (messageInput) {
+        messageInput.addEventListener('paste', (e) => {
+          const items = Array.from((e.clipboardData && e.clipboardData.items) || []);
+          const files = items
+            .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+            .map(item => item.getAsFile())
+            .filter(Boolean);
+          if (!files.length) return;
+          e.preventDefault();
+          addAttachments(files);
+        });
+      }
+
+      // Send button and Enter share this. Without attachments it is the
+      // unchanged text path.
+      async function sendCurrentInput() {
+        const text = messageInput.value.trim();
+        const pending = attachments;
+        if (!text && !pending.length) return;
+
+        if (pending.length) {
+          const label = `📎 ${pending.length} screenshot${pending.length > 1 ? 's' : ''}`;
+          addMessage(text ? `${label}\n${text}` : label, 'user');
+        } else {
+          addMessage(text, 'user');
+        }
+        messageInput.value = '';
+        autoGrow(messageInput);
+
+        // Show thinking indicator after user message
+        setTimeout(() => { showThinkingIndicator(); }, 300);
+
+        try {
+          if (pending.length) {
+            attachments = [];
+            renderAttachments();
+            const images = await Promise.all(pending.map(async att => ({
+              data: await att.file.arrayBuffer(),
+              mimeType: att.file.type
+            })));
+            pending.forEach(att => URL.revokeObjectURL(att.url));
+            const result = whysperAPI && whysperAPI.sendChatAttachments
+              ? await whysperAPI.sendChatAttachments({ text, images })
+              : { ok: false, error: 'Attachments are not available.' };
+            if (!result || !result.ok) {
+              hideThinkingIndicator();
+              addMessage((result && result.error) || 'Failed to send the screenshots.', 'error');
+            }
+          } else if (whysperAPI && whysperAPI.sendChatMessage) {
+            // Send to main process for session memory storage and LLM processing
+            await whysperAPI.sendChatMessage(text);
+          }
+        } catch (error) {
+          console.error('Failed to send chat message to main process:', error);
+        }
+      }
+
+      if (sendButton) {
+        sendButton.addEventListener('click', () => sendCurrentInput());
       }
 
       // Auto-resize for multiline textarea
@@ -1312,25 +1469,21 @@
 
       // Replace keypress with keydown to support Shift+Enter for newline and Enter to send
       if (messageInput) {
-        messageInput.addEventListener('keydown', async (e) => {
+        messageInput.addEventListener('keydown', (e) => {
           if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
-            const text = messageInput.value.trim();
-            if (text) {
-              addMessage(text, 'user');
-              messageInput.value = '';
-              autoGrow(messageInput);
-              setTimeout(() => { showThinkingIndicator(); }, 300);
-              try {
-                if (whysperAPI && whysperAPI.sendChatMessage) {
-                  await whysperAPI.sendChatMessage(text);
-                }
-              } catch (error) {
-                console.error('Failed to send chat message to main process:', error);
-              }
-            }
+            sendCurrentInput();
           }
           // If Shift+Enter, allow default to insert newline
+        });
+      }
+
+      // Screenshot analysis failures (hotkey or attachments) — don't leave
+      // the thinking indicator spinning.
+      if (whysperAPI && whysperAPI.onOcrError) {
+        whysperAPI.onOcrError((event, data) => {
+          try { hideThinkingIndicator(); } catch (_) {}
+          addMessage(`Screenshot analysis failed${data && data.error ? `: ${data.error}` : ''}`, 'error');
         });
       }
 

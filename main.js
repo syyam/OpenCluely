@@ -5,6 +5,13 @@ const { app, BrowserWindow, globalShortcut, session, ipcMain, dialog, desktopCap
 const candidateContext = require("./src/core/candidate-context");
 const interviewMetadata = require("./src/core/interview-metadata");
 const responseLanguage = require("./src/core/response-language");
+const framework = require("./src/core/framework");
+const codeFormats = require("./src/core/code-formats");
+const speechVocab = require("./src/core/speech-vocab");
+
+// Expansions offered under a finished answer in the overlay, plus
+// 'convert:<format id>' ones (src/core/code-formats.js) checked per answer.
+const EXPANSION_MODES = ['details', 'deep', 'optimized'];
 
 // ── Resolve a stable .env location ──
 // In packaged builds process.cwd() is unstable and frequently read-only
@@ -438,6 +445,11 @@ class ApplicationController {
   }
 
   setupServiceEventHandlers() {
+    // Read per transcription, so profile/framework changes apply to the next question.
+    speechService.setWhisperPromptProvider(() =>
+      speechVocab.getWhisperPrompt(this.activeSkill, framework.getFramework())
+    );
+
     speechService.on("recording-started", () => {
       windowManager.handleRecordingStarted();
     });
@@ -615,9 +627,9 @@ class ApplicationController {
     ipcMain.handle("resize-window", (event, { width, height }) => {
       const mainWindow = windowManager.getWindow("main");
       if (mainWindow) {
-        // Enforce horizontal constraints: min ~one icon, max original width
+        // Enforce horizontal constraints: min ~one icon, max the screen width
         const minW = 60;
-        const maxW = windowManager.windowConfigs?.main?.width || 520;
+        const maxW = windowManager.getMainMaxWidth(mainWindow);
         const clampedWidth = Math.max(minW, Math.min(maxW, Math.round(width || minW)));
         try {
           // Match content size to the DOM so no extra transparent area remains
@@ -691,8 +703,19 @@ class ApplicationController {
       return { success: true };
     });
 
-    ipcMain.handle("request-more-details", (event, messageId) => {
-      return this.requestMoreDetails(messageId);
+    // Screenshots pasted/attached in the chat input — same analysis flow as
+    // the full-screen hotkey (processImagesWithLLM).
+    ipcMain.handle("send-chat-attachments", (event, payload) => {
+      try {
+        return this.handleChatAttachments(payload);
+      } catch (error) {
+        logger.error("Failed to process chat attachments", { error: error.message });
+        return { ok: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("request-more-details", (event, messageId, mode) => {
+      return this.requestMoreDetails(messageId, mode);
     });
 
     ipcMain.handle("get-skill-prompt", (event, skillName) => {
@@ -1121,7 +1144,7 @@ class ApplicationController {
     try {
       windowManager.showLLMLoading();
 
-  const capture = await captureService.captureAndProcess();
+      const capture = await captureService.captureAndProcess();
 
       if (!capture.imageBuffer || !capture.imageBuffer.length) {
         windowManager.hideLLMResponse();
@@ -1129,10 +1152,36 @@ class ApplicationController {
         return;
       }
 
-      // Use image directly with LLM and active skill; do not send chat messages here
-      const sessionHistory = sessionManager.getOptimizedHistory();
+      await this.processImagesWithLLM(
+        [{ buffer: capture.imageBuffer, mimeType: capture.mimeType || 'image/png' }],
+        { source: 'screenshot' }
+      );
+    } catch (error) {
+      logger.error("Screenshot capture failed", {
+        error: error.message,
+        duration: Date.now() - startTime,
+      });
+      windowManager.hideLLMResponse();
+      this.broadcastOCRError(error.message);
+    }
+  }
+
+  /**
+   * The one screenshot-analysis flow, shared by the full-screen hotkey and
+   * images attached in chat — only where the images come from differs.
+   * Several images are one question and go to Gemini in one request, in order.
+   * @param {Array<{buffer: Buffer, mimeType: string}>} images
+   * @param {{text?: string, source?: string}} options - typed text sent with the images
+   */
+  async processImagesWithLLM(images, { text = '', source = 'screenshot' } = {}) {
+    const startTime = Date.now();
+    const typed = String(text || '').trim();
+
+    try {
+      windowManager.showLLMLoading();
 
       const needsProgrammingLanguage = promptLoader.requiresProgrammingLanguage(this.activeSkill);
+      const programmingLanguage = needsProgrammingLanguage ? this.promptLanguage() : null;
 
       this._responseSeq = (this._responseSeq || 0) + 1;
       const messageId = `img-${Date.now()}-${this._responseSeq}`;
@@ -1142,32 +1191,39 @@ class ApplicationController {
       });
 
       const llmResult = await llmService.processImageWithSkillStream(
-        capture.imageBuffer,
-        capture.mimeType || 'image/png',
+        images,
         this.activeSkill,
-        sessionHistory.recent,
-        needsProgrammingLanguage ? this.codingLanguage : null,
+        programmingLanguage,
         (delta) => {
           windowManager.broadcastToAllWindows("transcription-llm-response-chunk", {
             messageId,
             delta
           });
+        },
+        {
+          text: typed,
+          // A failed attempt's partial text is cleared before the retry.
+          onReset: () => windowManager.broadcastToAllWindows("transcription-llm-response-reset", { messageId })
         }
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
 
-      sessionManager.addModelResponse(llmResult.response, {
+      // Record a user turn for the screenshot too, so later requests (which
+      // now include history) see question → answer pairs.
+      const label = images.length > 1 ? `[Screenshots ×${images.length}]` : '[Screenshot]';
+      sessionManager.addUserInput(typed ? `${label} ${typed}` : label, source);
+      const eventId = sessionManager.addModelResponse(llmResult.response, {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
         isImageAnalysis: true
       });
-      this.rememberResponse(messageId, llmResult, {
+      const formats = this.rememberResponse(messageId, llmResult, {
+        eventId,
         kind: 'image',
-        question: '',
-        programmingLanguage: needsProgrammingLanguage ? this.codingLanguage : null,
-        imageBuffer: capture.imageBuffer,
-        mimeType: capture.mimeType || 'image/png'
+        question: typed,
+        programmingLanguage,
+        images
       });
 
       this.broadcastTranscriptionLLMResponse(llmResult);
@@ -1177,17 +1233,20 @@ class ApplicationController {
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
         isImageAnalysis: true,
-        messageId: llmResult.metadata.messageId
+        messageId: llmResult.metadata.messageId,
+        formats
       });
     } catch (error) {
-      logger.error("Screenshot OCR process failed", {
+      logger.error("Screenshot analysis failed", {
         error: error.message,
+        source,
+        imageCount: images.length,
         duration: Date.now() - startTime,
       });
 
       windowManager.hideLLMResponse();
       this.broadcastOCRError(error.message);
-      
+
       sessionManager.addConversationEvent({
         role: 'system',
         content: `Screenshot OCR failed: ${error.message}`,
@@ -1197,6 +1256,58 @@ class ApplicationController {
         }
       });
     }
+  }
+
+  /**
+   * Images attached in the chat input (paste or file picker). Validates type,
+   * keeps order, and only re-encodes when the set is too large for one
+   * inline Gemini request — at full resolution, so code stays legible.
+   * @param {{text?: string, images: Array<{data: ArrayBuffer|Uint8Array, mimeType: string}>}} payload
+   */
+  handleChatAttachments(payload) {
+    const ALLOWED = new Set(['image/png', 'image/jpeg', 'image/webp']);
+    // Gemini's inline request limit is ~20 MB and base64 adds ~33%.
+    const MAX_TOTAL_BYTES = 14 * 1024 * 1024;
+
+    const images = (payload && Array.isArray(payload.images) ? payload.images : [])
+      .filter(img => img && ALLOWED.has(img.mimeType) && img.data && img.data.byteLength)
+      .map(img => ({
+        buffer: img.data instanceof ArrayBuffer ? Buffer.from(img.data) : Buffer.from(img.data.buffer, img.data.byteOffset, img.data.byteLength),
+        mimeType: img.mimeType
+      }));
+
+    if (!images.length) {
+      return { ok: false, error: 'No supported images (PNG, JPEG or WebP) attached.' };
+    }
+
+    let total = images.reduce((n, img) => n + img.buffer.length, 0);
+    if (total > MAX_TOTAL_BYTES) {
+      const { nativeImage } = require("electron");
+      // Largest first; JPEG q90 at the original resolution — never downscaled.
+      for (const img of [...images].sort((a, b) => b.buffer.length - a.buffer.length)) {
+        if (total <= MAX_TOTAL_BYTES) break;
+        if (img.mimeType === 'image/jpeg') continue;
+        const jpeg = nativeImage.createFromBuffer(img.buffer).toJPEG(90);
+        if (jpeg.length && jpeg.length < img.buffer.length) {
+          total -= img.buffer.length - jpeg.length;
+          img.buffer = jpeg;
+          img.mimeType = 'image/jpeg';
+        }
+      }
+      if (total > MAX_TOTAL_BYTES) {
+        return { ok: false, error: 'The attached images are too large to send together — attach fewer images.' };
+      }
+    }
+
+    logger.info("Chat screenshot attachments received", {
+      imageCount: images.length,
+      totalBytes: total,
+      hasText: !!(payload.text && String(payload.text).trim())
+    });
+
+    // Fire and forget like send-chat-message; the answer streams back.
+    this.processImagesWithLLM(images, { text: payload.text || '', source: 'chat' });
+    return { ok: true };
   }
 
   async processWithLLM(text, sessionHistory) {
@@ -1218,35 +1329,37 @@ class ApplicationController {
         text,
         this.activeSkill,
         sessionHistory.recent,
-        needsProgrammingLanguage ? this.codingLanguage : null,
+        needsProgrammingLanguage ? this.promptLanguage() : null,
         (delta) => {
           windowManager.broadcastToAllWindows("transcription-llm-response-chunk", {
             messageId,
             delta
           });
-        }
+        },
+        () => windowManager.broadcastToAllWindows("transcription-llm-response-reset", { messageId })
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
 
       logger.info("LLM processing completed, showing response", {
         responseLength: llmResult.response.length,
         skill: this.activeSkill,
-        programmingLanguage: needsProgrammingLanguage ? this.codingLanguage : 'not applicable',
+        programmingLanguage: needsProgrammingLanguage ? this.promptLanguage() : 'not applicable',
         processingTime: llmResult.metadata.processingTime,
         responsePreview: llmResult.response.substring(0, 200) + "...",
       });
 
       // Record the question/answer pair once, now that the request is done.
       sessionManager.addUserInput(text, 'chat');
-      sessionManager.addModelResponse(llmResult.response, {
+      const eventId = sessionManager.addModelResponse(llmResult.response, {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
       });
-      this.rememberResponse(messageId, llmResult, {
+      const formats = this.rememberResponse(messageId, llmResult, {
+        eventId,
         kind: 'chat',
         question: text,
-        programmingLanguage: needsProgrammingLanguage ? this.codingLanguage : null
+        programmingLanguage: needsProgrammingLanguage ? this.promptLanguage() : null
       });
 
       this.broadcastTranscriptionLLMResponse(llmResult);
@@ -1256,6 +1369,7 @@ class ApplicationController {
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
         messageId: llmResult.metadata.messageId,
+        formats
       });
     } catch (error) {
       logger.error("LLM processing failed", {
@@ -1397,29 +1511,31 @@ class ApplicationController {
         cleanText,
         this.activeSkill,
         sessionHistory.recent,
-        needsProgrammingLanguage ? this.codingLanguage : null,
+        needsProgrammingLanguage ? this.promptLanguage() : null,
         (delta) => {
           this.sendToVoiceResponseWindows("transcription-llm-response-chunk", {
             messageId,
             delta
           });
-        }
+        },
+        () => this.sendToVoiceResponseWindows("transcription-llm-response-reset", { messageId })
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
 
       // Record the question/answer pair once, now that the request is done
       // (the question was not in history while the request was built).
       sessionManager.addUserInput(cleanText, 'speech');
-      sessionManager.addModelResponse(llmResult.response, {
+      const eventId = sessionManager.addModelResponse(llmResult.response, {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
         isTranscriptionResponse: true
       });
-      this.rememberResponse(messageId, llmResult, {
+      const formats = this.rememberResponse(messageId, llmResult, {
+        eventId,
         kind: 'voice',
         question: cleanText,
-        programmingLanguage: needsProgrammingLanguage ? this.codingLanguage : null
+        programmingLanguage: needsProgrammingLanguage ? this.promptLanguage() : null
       });
 
       this.sendTranscriptionLLMResponseToVoiceTargets(llmResult);
@@ -1429,14 +1545,15 @@ class ApplicationController {
           processingTime: llmResult.metadata.processingTime,
           usedFallback: llmResult.metadata.usedFallback,
           isTranscriptionResponse: true,
-          messageId: llmResult.metadata.messageId
+          messageId: llmResult.metadata.messageId,
+          formats
         });
       }
 
       logger.info("Transcription LLM response completed", {
         responseLength: llmResult.response.length,
         skill: this.activeSkill,
-        programmingLanguage: needsProgrammingLanguage ? this.codingLanguage : 'not applicable',
+        programmingLanguage: needsProgrammingLanguage ? this.promptLanguage() : 'not applicable',
         processingTime: llmResult.metadata.processingTime
       });
 
@@ -1610,37 +1727,62 @@ class ApplicationController {
    * are kept — a fallback ("could you repeat…") reply can't be expanded. The
    * profile/language that produced the answer are stored with it so an
    * expansion never mixes profiles after a profile switch.
+   * Returns the code-format conversions offered for it ([] = none).
    */
   rememberResponse(messageId, llmResult, details) {
     if (!messageId || !llmResult || !llmResult.response || (llmResult.metadata && llmResult.metadata.usedFallback)) {
-      return;
+      return [];
     }
+    const codingFramework = framework.getFramework();
+    const formats = framework.offersWebFrameworks(this.activeSkill)
+      ? codeFormats.conversionOptions(llmResult.response, codingFramework)
+      : [];
     this._responseRecords.set(messageId, {
       ...details,
       answer: llmResult.response,
-      skill: this.activeSkill
+      skill: this.activeSkill,
+      framework: codingFramework,
+      formats
     });
     while (this._responseRecords.size > this._maxResponseRecords) {
       const oldest = this._responseRecords.keys().next().value;
       this._responseRecords.delete(oldest);
-      this._expansionsRequested.delete(oldest);
+      for (const key of this._expansionsRequested) {
+        if (key.startsWith(`${oldest}:`)) this._expansionsRequested.delete(key);
+      }
     }
+    return formats;
   }
 
   /**
-   * User clicked "More details" on an answer in the overlay. Returns right
-   * away ({ok} / {ok:false, reason}); the expansion streams to the overlay
-   * under the parent answer. Never touches conversation history.
+   * User clicked "More details", "Deep reasoning", "Optimized solution" or a
+   * format conversion ('convert:<id>') on an answer in the overlay. Returns
+   * right away ({ok} / {ok:false, reason}); the expansion streams to the
+   * overlay under the parent answer, in parallel with any new question.
+   * Expansions are never added to conversation history as turns: only a
+   * newer version of the code (Optimized, converted, or Deep reasoning's
+   * "Improved" section) is attached to the parent answer's history event,
+   * and it's sent only while that answer is still the latest one
+   * (LLMService._historyContents).
    */
-  requestMoreDetails(parentMessageId) {
-    const record = this._responseRecords.get(parentMessageId);
-    if (!record) {
+  requestMoreDetails(parentMessageId, mode = 'details') {
+    const convertId = String(mode).startsWith('convert:') ? mode.slice(8) : null;
+    if (!EXPANSION_MODES.includes(mode) && !convertId) {
       return { ok: false, reason: 'unavailable' };
     }
-    if (this._expansionsRequested.has(parentMessageId)) {
+    const record = this._responseRecords.get(parentMessageId);
+    // "Optimized solution" only makes sense for an answer that has code; a
+    // conversion only for a format offered under that answer. "More details"
+    // and "Deep reasoning" work on any answer.
+    if (!record || (mode === 'optimized' && !/```/.test(record.answer)) ||
+        (convertId && !(record.formats || []).some(f => f.id === convertId))) {
+      return { ok: false, reason: 'unavailable' };
+    }
+    const requestKey = `${parentMessageId}:${mode}`;
+    if (this._expansionsRequested.has(requestKey)) {
       return { ok: false, reason: 'duplicate' };
     }
-    this._expansionsRequested.add(parentMessageId);
+    this._expansionsRequested.add(requestKey);
 
     this._responseSeq = (this._responseSeq || 0) + 1;
     const messageId = `exp-${Date.now()}-${this._responseSeq}`;
@@ -1650,31 +1792,53 @@ class ApplicationController {
         messageId,
         parentMessageId,
         isExpansion: true,
+        mode,
         skill: record.skill
       });
       try {
         const llmResult = await llmService.processExpansionStream(record, (delta) => {
           this.sendToOverlay("transcription-llm-response-chunk", { messageId, delta });
-        });
+        }, mode, () => this.sendToOverlay("transcription-llm-response-reset", { messageId }));
+        // The newer code becomes the solution a follow-up ("now add
+        // pagination") builds on. Deep reasoning counts only when it wrote
+        // an "Improved" section; its explanation and "More details" never
+        // go into history.
+        const latestCode = mode === 'optimized' || convertId
+          ? codeFormats.solutionCode(llmResult.response)
+          : mode === 'deep' ? codeFormats.solutionCode(llmResult.response, { afterHeading: 'Improved' }) : '';
+        if (latestCode && record.eventId) {
+          sessionManager.setLatestCode(record.eventId, { mode, code: latestCode });
+        }
+        // A converted solution is a full answer of its own, so it can get
+        // "More details" / "Deep reasoning" / "Optimized solution" too: same
+        // question, profile, language, framework and history event as its
+        // parent, the converted code as the answer, and its format pinned
+        // (record.format) so those keep it. No format buttons on it
+        // (convert from the original).
+        if (convertId) {
+          this._responseRecords.set(messageId, { ...record, answer: llmResult.response, format: convertId, formats: [] });
+        }
         windowManager.showLLMResponse(llmResult.response, {
           skill: record.skill,
           processingTime: llmResult.metadata.processingTime,
           usedFallback: false,
           isExpansion: true,
+          expansionMode: mode,
           messageId,
           parentMessageId
         });
-        logger.info("More details response completed", {
+        logger.info("Expansion response completed", {
           parentMessageId,
+          mode,
           originalLength: record.answer.length,
           responseLength: llmResult.response.length,
           processingTime: llmResult.metadata.processingTime
         });
       } catch (error) {
-        logger.error("More details request failed", { parentMessageId, error: error.message });
+        logger.error("Expansion request failed", { parentMessageId, mode, error: error.message });
         // Allow a retry from the same button.
-        this._expansionsRequested.delete(parentMessageId);
-        this.sendToOverlay("more-details-failed", { parentMessageId, messageId, error: error.message });
+        this._expansionsRequested.delete(requestKey);
+        this.sendToOverlay("more-details-failed", { parentMessageId, messageId, mode, error: error.message });
       }
     })();
 
@@ -1733,6 +1897,22 @@ class ApplicationController {
     return this._whisperInstaller;
   }
 
+  /**
+   * Coding language for prompts: the dropdown's language, unless the
+   * selected framework can't be written in it (Rails → Ruby). The dropdown
+   * itself is never changed.
+   */
+  promptLanguage() {
+    return framework.getEffectiveLanguage(framework.getFramework(), this.codingLanguage);
+  }
+
+  broadcastFramework() {
+    windowManager.broadcastToAllWindows("coding-framework-changed", {
+      framework: framework.getFramework(),
+      options: framework.getFrameworkOptions(this.activeSkill),
+    });
+  }
+
   getSettings() {
     // Surface every value the settings UI can edit, reading the live source
     // of truth (process.env) so the UI shows exactly what the running app is
@@ -1740,6 +1920,8 @@ class ApplicationController {
     // distinguish "unset" from "stale value from a previous load".
     return {
       codingLanguage: this.codingLanguage || candidateContext.getProfileDefaultLanguage(this.activeSkill),
+      codingFramework: framework.getFramework(),
+      frameworkOptions: framework.getFrameworkOptions(this.activeSkill),
       appIcon: this.appIcon || "terminal",
       selectedIcon: this.appIcon || "terminal",
       windowGap: windowManager.windowGap,
@@ -1756,7 +1938,7 @@ class ApplicationController {
       whisperResponseTarget: process.env.WHISPER_RESPONSE_TARGET || "both",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
       geminiKey: process.env.GEMINI_API_KEY || "",
-      geminiModel: process.env.GEMINI_MODEL || "gemini-3.1-flash-lite",
+      geminiModel: process.env.GEMINI_MODEL || "gemini-3.5-flash-lite",
 
       resumeProfile: this.activeSkill || candidateContext.DEFAULT_PROFILE,
       resumeProfiles: candidateContext.getProfileList(),
@@ -1809,6 +1991,17 @@ class ApplicationController {
             language: this.codingLanguage,
           });
         }
+        // Each profile offers its own framework list; a pick the new profile
+        // doesn't offer falls back to Auto.
+        if (profileChanged && settings.codingFramework === undefined) {
+          framework.setFramework(framework.getFramework(), this.activeSkill);
+          this.broadcastFramework();
+        }
+      }
+      // After the profile block so it's validated against the new profile.
+      if (settings.codingFramework !== undefined) {
+        framework.setFramework(settings.codingFramework, this.activeSkill);
+        this.broadcastFramework();
       }
       // Resume/background text — stored in its own file per profile, not
       // .env (see candidate-context.js: .env values get newline-collapsed
@@ -1869,7 +2062,7 @@ class ApplicationController {
       if (settings.geminiKey !== undefined) {
         envUpdates.GEMINI_API_KEY = settings.geminiKey;
       }
-      if (["gemini-3.1-flash-lite", "gemini-3.1-pro"].includes(settings.geminiModel)) {
+      if (["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-pro"].includes(settings.geminiModel)) {
         envUpdates.GEMINI_MODEL = settings.geminiModel;
       }
 

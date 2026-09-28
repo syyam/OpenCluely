@@ -19,7 +19,8 @@ model_device = None
 # Biases decoding toward these terms so common technical/interview vocabulary
 # isn't misheard as similar-sounding everyday words (e.g. "Coroutines" as
 # "collagens"). Whisper only attends to roughly the last ~224 prompt tokens,
-# so this stays a flat term list rather than prose.
+# so this stays a flat term list rather than prose. Used when the request
+# carries no 'prompt' (src/core/speech-vocab.js builds a profile-specific one).
 TECHNICAL_VOCAB_PROMPT = (
     "Kotlin, Coroutines, Android, Jetpack Compose, Retrofit, Gradle, AOSP, "
     "React, React Native, TypeScript, Java, API, CI/CD, GraphQL, Git, Docker, "
@@ -122,7 +123,7 @@ def load_audio_input(audio_path):
         return audio_path, None
 
 
-def _decode(loaded_model, audio_input, language, device):
+def _decode(loaded_model, audio_input, language, device, prompt=None):
     """Run the actual Whisper forward pass. Shared by real transcription and
     the post-load dummy warmup call so both pay/skip the same CUDA kernel
     selection cost through the identical code path."""
@@ -135,7 +136,7 @@ def _decode(loaded_model, audio_input, language, device):
         verbose=None,
         temperature=0,
         condition_on_previous_text=False,
-        initial_prompt=TECHNICAL_VOCAB_PROMPT,
+        initial_prompt=prompt or TECHNICAL_VOCAB_PROMPT,
         logprob_threshold=-1.0,
         no_speech_threshold=0.6,
         compression_ratio_threshold=2.4,
@@ -160,7 +161,7 @@ def transcribe(request):
 
     audio_input, duration_seconds = load_audio_input(request['audio_path'])
 
-    result, inference_ms = _decode(loaded_model, audio_input, language, device)
+    result, inference_ms = _decode(loaded_model, audio_input, language, device, request.get('prompt'))
 
     rtf = None
     if duration_seconds:

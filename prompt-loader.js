@@ -2,9 +2,10 @@ const fs = require('fs');
 const path = require('path');
 const { getCandidateContextBlock } = require('./src/core/candidate-context');
 const { getInterviewMetadataBlock } = require('./src/core/interview-metadata');
-const { getResponseLanguageInstructionBlock } = require('./src/core/response-language');
+const { getResponseLanguageInstructionBlock, isJapaneseModeEnabled } = require('./src/core/response-language');
 const { getIdentityBlock } = require('./src/core/identity');
 const { getCodingAnswerBlock } = require('./src/core/answer-format');
+const { getFramework, getFrameworkBlock, getFrameworkDefaultsBlock } = require('./src/core/framework');
 
 class PromptLoader {
   constructor() {
@@ -50,9 +51,10 @@ class PromptLoader {
    * Get the system prompt for a specific skill with optional programming language injection
    * @param {string} skillName - The name of the skill
    * @param {string|null} programmingLanguage - Optional programming language to inject
+   * @param {string} framework - Framework id (src/core/framework.js); defaults to the current selection
    * @returns {string|null} The system prompt content or null if not found
    */
-  getSkillPrompt(skillName, programmingLanguage = null) {
+  getSkillPrompt(skillName, programmingLanguage = null, framework = getFramework()) {
     if (!this.promptsLoaded) {
       this.loadPrompts();
     }
@@ -68,13 +70,19 @@ class PromptLoader {
     if (programmingLanguage && this.requiresProgrammingLanguage(normalizedSkillName)) {
       promptContent = this.injectProgrammingLanguage(promptContent, programmingLanguage, normalizedSkillName);
     }
+    // Framework preference ('' for Auto) — which framework to build with
+    // when code is needed; never whether code is needed.
+    promptContent += getFrameworkBlock(framework);
+    // Default code format per web framework (React/Vue) — web profiles only.
+    promptContent += getFrameworkDefaultsBlock(normalizedSkillName);
 
     // Always included: the active profile's resume (normalizedSkillName
     // doubles as the resume-profile id, so only that profile's resume is
-    // read — never another profile's) plus the global interview notes
-    // (visa/relocation/self-intro, profile-independent by design).
+    // read — never another profile's). The global interview notes
+    // (visa/relocation/self-intro, profile-independent) are only sent in
+    // Japanese mode.
     promptContent += getCandidateContextBlock(normalizedSkillName);
-    promptContent += getInterviewMetadataBlock();
+    if (isJapaneseModeEnabled()) promptContent += getInterviewMetadataBlock();
     // When an answer gets code and how a coding answer is structured — the
     // single shared copy for every profile (see src/core/answer-format.js).
     promptContent += getCodingAnswerBlock();
@@ -107,7 +115,7 @@ class PromptLoader {
     const languageInjection = `
 
 ## Implementation language: ${languageUpper}
-When code is needed (see "When code is needed" below), write it ONLY in ${languageTitle} — no snippets or alternatives in other languages — fenced with the exact tag \`\`\`${fenceTag}. Selecting a language does not mean an answer needs code.`;
+When code is needed (see "When code is needed" below), plain code (algorithms, functions, utilities, logic) is written in ${languageTitle} only — no alternatives in other languages — fenced \`\`\`${fenceTag}. Framework code (a component or page) uses that framework's normal file format (e.g. a Vue SFC, an HTML page, TSX), with ${languageTitle} in its script wherever that format allows it. Selecting a language does not mean an answer needs code.`;
 
     return promptContent + languageInjection;
   }

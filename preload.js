@@ -35,6 +35,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   clearSessionMemory: () => ipcRenderer.invoke('clear-session-memory'),
   formatSessionHistory: () => ipcRenderer.invoke('format-session-history'),
   sendChatMessage: (text) => ipcRenderer.invoke('send-chat-message', text),
+  // { text, images: [{ data: ArrayBuffer, mimeType }] } — screenshots attached in chat
+  sendChatAttachments: (payload) => ipcRenderer.invoke('send-chat-attachments', payload),
   getSkillPrompt: (skillName) => ipcRenderer.invoke('get-skill-prompt', skillName),
   
   // Gemini LLM configuration
@@ -117,8 +119,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onTranscriptionLlmResponse: (callback) => ipcRenderer.on('transcription-llm-response', callback),
   onTranscriptionLlmResponseStart: (callback) => ipcRenderer.on('transcription-llm-response-start', callback),
   onTranscriptionLlmResponseChunk: (callback) => ipcRenderer.on('transcription-llm-response-chunk', callback),
+  // A streamed attempt broke off; discard its partial text (a retry follows).
+  onTranscriptionLlmResponseReset: (callback) => ipcRenderer.on('transcription-llm-response-reset', callback),
   // "More details" (AI Response overlay only)
-  requestMoreDetails: (messageId) => ipcRenderer.invoke('request-more-details', messageId),
+  // mode: 'details' (default) or 'optimized'
+  requestMoreDetails: (messageId, mode) => ipcRenderer.invoke('request-more-details', messageId, mode),
   onMoreDetailsFailed: (callback) => ipcRenderer.on('more-details-failed', callback),
   onOpenGeminiConfig: (callback) => ipcRenderer.on('open-gemini-config', callback),
   onDisplayLlmResponse: (callback) => ipcRenderer.on('display-llm-response', callback),
@@ -128,6 +133,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onRecordingStarted: (callback) => ipcRenderer.on('recording-started', callback),
   onRecordingStopped: (callback) => ipcRenderer.on('recording-stopped', callback),
   onCodingLanguageChanged: (callback) => ipcRenderer.on('coding-language-changed', callback),
+  onCodingFrameworkChanged: (callback) => ipcRenderer.on('coding-framework-changed', callback),
   onJapaneseModeChanged: (callback) => ipcRenderer.on('japanese-mode-changed', callback),
   onMainWindowShown: (callback) => ipcRenderer.on('main-window-shown', callback),
   

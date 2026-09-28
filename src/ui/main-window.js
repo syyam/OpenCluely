@@ -40,6 +40,11 @@ class MainWindowUI {
 
             this.updateAllElementStates(); // Update all elements with current state
             this.resizeWindowToContent();
+            // Icon/text fonts can finish loading after the first measure and
+            // change the bar's width — fit again once they're in.
+            if (document.fonts && document.fonts.ready) {
+                document.fonts.ready.then(() => this.resizeWindowToContent()).catch(() => {});
+            }
 
             logger.info('Main window UI initialized', {
                 component: 'MainWindowUI',
@@ -213,7 +218,9 @@ class MainWindowUI {
             const commandTab = document.querySelector('.command-tab');
             if (commandTab && window.electronAPI && window.electronAPI.resizeWindow) {
                 const rect = commandTab.getBoundingClientRect();
-                const width = Math.ceil(rect.width);
+                // scrollWidth counts buttons that are currently clipped by a
+                // too-narrow window, so the bar always grows to fit them all.
+                const width = Math.ceil(Math.max(rect.width, commandTab.scrollWidth));
                 let height = Math.ceil(rect.height);
 
                 // If shortcuts popover is visible, extend height to fit it
@@ -389,13 +396,7 @@ class MainWindowUI {
                     window.electronAPI.saveSettings({ codingLanguage: lang });
                 }
                 // Resize for any width change
-                setTimeout(() => {
-                    const commandTab = document.querySelector('.command-tab');
-                    if (commandTab && window.electronAPI && window.electronAPI.resizeWindow) {
-                        const rect = commandTab.getBoundingClientRect();
-                        window.electronAPI.resizeWindow(Math.ceil(rect.width), Math.ceil(rect.height));
-                    }
-                }, 50);
+                this.resizeWindowToContent();
             });
         }
 

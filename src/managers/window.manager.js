@@ -40,11 +40,8 @@ class WindowManager {
     
     this.windowConfigs = {
       main: {
-        // 520 was the original cap; 600 accounted for the close/quit button;
-        // now +1 more item (the Japanese-mode toggle) needs headroom again —
-        // both the BrowserWindow's maxWidth (below) and the resize-window
-        // IPC clamp in main.js read this same value, so an undersized cap
-        // clips new bar items outside the window's visible bounds.
+        // Initial width only; the bar then resizes to fit its buttons, up to
+        // the screen width (getMainMaxWidth).
         width: 680,
         height: 35,
         useContentSize: true,
@@ -356,9 +353,9 @@ class WindowManager {
         backgroundColor: '#00000000',
   // Allow resizing so users can adjust width; we will lock height in handlers
   resizable: true,
-    // Keep the original max width as cap; allow small min width so it can collapse to one icon
+    // Small min width so it can collapse to one icon; no max width — the bar
+    // is sized to its buttons (see getMainMaxWidth).
     minWidth: 60,
-    maxWidth: this.windowConfigs.main.width,
         minimizable: false,
         maximizable: false,
         closable: false,
@@ -504,7 +501,7 @@ class WindowManager {
             event.preventDefault();
             // Enforce width within min/max bounds
             const minW = 60;
-            const maxW = this.windowConfigs.main.width;
+            const maxW = this.getMainMaxWidth(window);
             const desiredW = Math.max(minW, Math.min(maxW, Math.round(newBounds.width || minW)));
             window.setContentSize(desiredW, Math.max(1, currentContentHeight));
           } catch (e) {
@@ -513,7 +510,7 @@ class WindowManager {
               const [__w, currentWindowHeight] = window.getSize();
               event.preventDefault();
               const minW = 60;
-              const maxW = this.windowConfigs.main.width;
+              const maxW = this.getMainMaxWidth(window);
               const desiredW = Math.max(minW, Math.min(maxW, Math.round(newBounds.width || minW)));
               window.setSize(desiredW, Math.max(1, currentWindowHeight));
             } catch { /* noop */ }
@@ -1514,6 +1511,22 @@ class WindowManager {
       dataPreview: data && data.content ? data.content.substring(0, 50) + '...' : 
                    data && data.response ? data.response.substring(0, 50) + '...' : 'No response'
     });
+  }
+
+  /**
+   * Widest the command bar may get: the work area of the display it's on.
+   * The bar sizes itself to its buttons (resize-window IPC), so there is no
+   * fixed cap to bump every time a button is added.
+   */
+  getMainMaxWidth(window) {
+    try {
+      const display = window && !window.isDestroyed()
+        ? screen.getDisplayMatching(window.getBounds())
+        : screen.getPrimaryDisplay();
+      return (display.workArea || display.workAreaSize).width;
+    } catch (_) {
+      return this.windowConfigs.main.width;
+    }
   }
 
   getWindow(type) {
