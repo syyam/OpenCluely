@@ -250,6 +250,7 @@ class MainWindowUI {
     this.shortcutsPopover = document.getElementById('shortcutsPopover');
     this.closeAppButton = document.getElementById('closeAppButton');
     this.japaneseModeButton = document.getElementById('japaneseModeButton');
+    this.systemDesignButton = document.getElementById('systemDesignButton');
 
         // NEW: Screenshot button is the first .command-item without id
         const commandItems = document.querySelectorAll('.command-item');
@@ -285,6 +286,35 @@ class MainWindowUI {
         // main process, then mirrors the returned state onto the button's
         // 'active' class (the single visible source of truth) and broadcasts
         // so it can't silently drift from Settings or other windows.
+        // System design round mode (src/core/system-design.js). Off pauses
+        // the round (requirements / design / Build design stay for when it's
+        // switched back on); the chat window shows the requirements card.
+        if (this.systemDesignButton) {
+            this.systemDesignButton.addEventListener('click', async () => {
+                if (!this.isInteractive) return;
+                if (!window.electronAPI || !window.electronAPI.toggleSystemDesign) return;
+                try {
+                    const st = await window.electronAPI.toggleSystemDesign(!this.systemDesignButton.classList.contains('active'));
+                    if (st) this.systemDesignButton.classList.toggle('active', !!st.on);
+                } catch (error) {
+                    logger.error('Failed to toggle system design mode', {
+                        component: 'MainWindowUI',
+                        error: error.message
+                    });
+                }
+            });
+            if (window.electronAPI && window.electronAPI.getSystemDesignState) {
+                window.electronAPI.getSystemDesignState()
+                    .then(st => { if (st) this.systemDesignButton.classList.toggle('active', !!st.on); })
+                    .catch(() => {});
+            }
+            if (window.electronAPI && window.electronAPI.onSystemDesignState) {
+                window.electronAPI.onSystemDesignState((event, st) => {
+                    if (st && typeof st.on === 'boolean') this.systemDesignButton.classList.toggle('active', st.on);
+                });
+            }
+        }
+
         if (this.japaneseModeButton) {
             this.japaneseModeButton.addEventListener('click', async () => {
                 if (!this.isInteractive) return;

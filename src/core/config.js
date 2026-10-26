@@ -57,7 +57,16 @@ class ConfigManager {
           // quota 429 it fails fast. Tested with the real voice prompt: first
           // chunk 4.7-5.9s. Not usable: 2.5-flash-lite (404, retired), Gemma 4
           // (16K TPM free, rejects thinkingBudget, emits its reasoning).
-          fallbackModels: ['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite-preview'],
+          // 3rd slot (2026-09-29): gemini-3-flash-preview, ahead of the
+          // preview. The preview shares 3.1-flash-lite's quota and failed
+          // with it when 3.5-flash-lite was out of quota (every model busy →
+          // canned reply); 3-flash-preview has its own quota and capacity.
+          // Real prompt, thinking off (budget 0 accepted): first chunk ~1.1s
+          // on short answers; code arrives whole in 4.6-7.9s; toBe tests 5/5.
+          // Its free-tier daily limit is unknown (likely below the lite
+          // models' 500); a quota 429 just skips it to the preview. Only slow
+          // with medium thinking, which is why the reasoning chain rejects it.
+          fallbackModels: ['gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview'],
           maxRetries: 3,
           timeout: 30000,
           // A streamed attempt that sends nothing at all within this long is
@@ -72,6 +81,28 @@ class ConfigManager {
           // and SDK fallbacks: no new attempt/retry starts after it (an
           // attempt already running is not cut off).
           requestBudgetMs: 12000,
+          // Hedged start (normal chain only): if the first model sends nothing
+          // this long, the next one starts in parallel and whichever streams
+          // first is shown — a sick primary costs ~3.5s, not the full 8s.
+          hedgeAfterMs: 3500,
+          // Background health checks (src/services/model-monitor.js): a model
+          // that was skipped comes back only after a tiny "Say hi." request
+          // streams within firstChunkTimeoutMs, so no real question waits on it.
+          // 5s, not stricter: on a busy day (2026-09-29) even healthy backups
+          // took ~3.5s to a first chunk, and a slow model that gets back in
+          // costs at most hedgeAfterMs before the backup takes over again.
+          // Deep reasoning's primary (3.6-flash, 20 RPD free) is probed too,
+          // and every probe counts against that quota: one at startup, then
+          // only when its skip ends (the 2→5→10→20→30 min ladder), and never
+          // after a daily-quota 429 (saved until the Pacific midnight reset).
+          probe: {
+            firstChunkTimeoutMs: 5000,
+            // Reasoning-only models (probed with thinkingLevel 'minimal').
+            reasoningFirstChunkTimeoutMs: 8000,
+            timeoutMs: 10000,
+            intervalMs: 10000,       // how often due probes are checked
+            networkRetryMs: 60000    // probe failed for a non-model reason (offline)
+          },
           // "Optimized solution" and "Deep reasoning" only — normal answers
           // keep the model above with thinkingBudget 0 / 'minimal' for speed.
           // Streamed deep-review prompt, medium thinking, 2026-09-27:
@@ -82,8 +113,14 @@ class ConfigManager {
           // Vue answer): it kept the given watch+timer structure where
           // 3.1-flash-lite rewrote it around a custom debounce(). Free tier:
           // 3.6-flash 20 RPD; the lite models 500 RPD each.
+          // 3.8-flash first (2026-10-10): Google retired 3.7-flash (requests
+          // redirect to 3.8). Raw stream, real Deep/Optimized requests, 2
+          // questions × 2 modes, no fallback: 3.8-flash 4/4 OK, first chunk
+          // 9-29s; 3.6-flash 2/4 (two 503 "high demand"), first chunk 8-15s.
+          // Quality similar. Free tier: 3.8-flash has its own 5 RPM / 20 RPD,
+          // so together with 3.6-flash Deep gets 40/day before the lite models.
           reasoning: {
-            models: ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'],
+            models: ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'],
             thinkingLevel: 'medium',
             maxOutputTokens: 8192,
             // Stalled model → next model. The primary (3.6-flash) thinks
@@ -93,6 +130,11 @@ class ConfigManager {
             // reasoning answer start after ~23s instead of ~13s (live test).
             firstChunkTimeoutMs: 20000,
             backupFirstChunkTimeoutMs: 10000,
+            // Hedged start: 3.6-flash normally thinks 6-15s before its first
+            // text; after 12s of silence the first backup starts in parallel
+            // and whichever streams first is shown, so a stuck primary costs
+            // ~12s instead of the full 20s before the backup even begins.
+            hedgeAfterMs: 12000,
             // Socket/request timeout; the normal path keeps `timeout` below.
             timeoutMs: 60000,
             requestBudgetMs: 60000

@@ -39,7 +39,8 @@ function setJapaneseModeEnabled(enabled) {
 function getResponseLanguageInstructionBlock() {
   if (!isJapaneseModeEnabled()) {
     return `\n\n## Response Language: English
-Always respond in English, regardless of what language the transcript, question, or screenshot text is in. Do not switch languages to match the input.`;
+Always respond in English, regardless of what language the transcript, question, or screenshot text is in. Do not switch languages to match the input.
+Write the explanation the way you'd say it to an interviewer across the table: short spoken sentences, plain words, first person where it's natural ('the way I think about it…', 'in practice I…'). No textbook or documentation phrasing, and no glossary-style **Term:** definition bullets — a bullet is a sentence I can read out as it is. Keep headings few and short.`;
   }
   return `\n\n## Response Language: Japanese (Romaji Only)
 Write all explanatory prose in Japanese, using ONLY Hepburn-style romanization (Latin alphabet). Do not use any hiragana, katakana, or kanji characters anywhere in your response — every Japanese word must be spelled out phonetically in romaji (e.g. "kore wa" not "これは").

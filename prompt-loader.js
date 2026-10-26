@@ -5,7 +5,8 @@ const { getInterviewMetadataBlock } = require('./src/core/interview-metadata');
 const { getResponseLanguageInstructionBlock, isJapaneseModeEnabled } = require('./src/core/response-language');
 const { getIdentityBlock } = require('./src/core/identity');
 const { getCodingAnswerBlock } = require('./src/core/answer-format');
-const { getFramework, getFrameworkBlock, getFrameworkDefaultsBlock } = require('./src/core/framework');
+const { getFramework, getFrameworkBlock, getFrameworkDefaultsBlock, expectsAlgorithms } = require('./src/core/framework');
+const { getSystemDesignBlock } = require('./src/core/system-design');
 
 class PromptLoader {
   constructor() {
@@ -74,7 +75,7 @@ class PromptLoader {
     // when code is needed; never whether code is needed.
     promptContent += getFrameworkBlock(framework);
     // Default code format per web framework (React/Vue) — web profiles only.
-    promptContent += getFrameworkDefaultsBlock(normalizedSkillName);
+    promptContent += getFrameworkDefaultsBlock(normalizedSkillName, framework);
 
     // Always included: the active profile's resume (normalizedSkillName
     // doubles as the resume-profile id, so only that profile's resume is
@@ -85,7 +86,10 @@ class PromptLoader {
     if (isJapaneseModeEnabled()) promptContent += getInterviewMetadataBlock();
     // When an answer gets code and how a coding answer is structured — the
     // single shared copy for every profile (see src/core/answer-format.js).
-    promptContent += getCodingAnswerBlock();
+    promptContent += getCodingAnswerBlock({ bruteForce: expectsAlgorithms(framework) });
+    // System design round mode (chat header toggle): the stage rules and this
+    // profile's playbook. '' when the mode is off.
+    promptContent += getSystemDesignBlock(normalizedSkillName, framework);
     // How to voice the answer (as Syyam, no AI self-reference, no filler).
     promptContent += getIdentityBlock();
     // The only thing establishing a default output language (English) when

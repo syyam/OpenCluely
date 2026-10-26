@@ -11,6 +11,13 @@
 // A success clears the model. Network errors and bad requests (400) are not
 // the model's fault and are never recorded. Only day-long entries are saved
 // to disk, so a restart doesn't re-probe a model known to be out of quota.
+//
+// Overloaded/silent skips grow while a model keeps failing (2-3 → 5 → 10 →
+// 20 → 30 min; reset by a success), so a long outage isn't re-tried every
+// few minutes. Models handed to setProbeModels (the normal answer chain, see
+// src/services/model-monitor.js) don't come back on their own when the skip
+// ends: they stay skipped until a small background probe (or any request)
+// succeeds, so a real question never has to find out whether it recovered.
 const fs = require('fs');
 const path = require('path');
 const logger = require('./logger').createServiceLogger('MODEL-HEALTH');
@@ -23,11 +30,23 @@ const DEFAULTS = {
   minuteQuotaMinMs: 15 * 1000,
   minuteQuotaMaxMs: 2 * 60 * 1000,
   retiredCooldownMs: 24 * 60 * 60 * 1000,
+  // Later steps for a model that keeps failing (overloaded/silent); the first
+  // step is overloadCooldownMs / stallCooldownMs.
+  escalationMs: [5 * 60 * 1000, 10 * 60 * 1000, 20 * 60 * 1000, 30 * 60 * 1000],
 };
 const PERSISTED = new Set(['daily-quota', 'retired']);
 
 let now = () => Date.now();
 let entries = null; // model → { until, reason }
+const strikes = new Map(); // model → overloaded/silent failures since its last success
+let probeModels = new Set(); // models whose expired skip waits for a probe
+const listeners = new Set();
+
+function notify() {
+  for (const fn of listeners) {
+    try { fn(); } catch (_) { /* a listener's problem, not ours */ }
+  }
+}
 
 function settings() {
   return { ...DEFAULTS, ...(config.get('llm.gemini.modelHealth') || {}) };
@@ -89,11 +108,21 @@ function parseRetryDelayMs(message) {
   return m ? Math.round(Number(m[1]) * 1000) : null;
 }
 
+/** Skip length for the n-th consecutive overloaded/silent failure (0-based). */
+function escalatedMs(firstMs, strike, s) {
+  if (!strike) return firstMs;
+  const steps = s.escalationMs || [];
+  if (!steps.length) return firstMs;
+  return Math.max(firstMs, steps[Math.min(strike, steps.length) - 1]);
+}
+
 /**
  * How long a failure should keep a model out of first place.
+ * @param {number} strike - earlier overloaded/silent failures of this model
+ *   since its last success; lengthens those two kinds of skip
  * @returns {{reason: string, until: number}|null} null = don't record
  */
-function classify(error) {
+function classify(error, strike = 0) {
   const msg = String((error && error.message) || error || '');
   const s = settings();
   const t = now();
@@ -104,10 +133,10 @@ function classify(error) {
   }
   if (/\b404\b|NOT_FOUND|no longer available/.test(msg)) return { reason: 'retired', until: t + s.retiredCooldownMs };
   if (error && (error.firstChunkTimeout || (error.incompleteStream && /timeout/i.test(msg)))) {
-    return { reason: 'silent', until: t + s.stallCooldownMs };
+    return { reason: 'silent', until: t + escalatedMs(s.stallCooldownMs, strike, s) };
   }
   if ((error && error.incompleteStream) || /\b503\b|UNAVAILABLE|high demand|overloaded/i.test(msg)) {
-    return { reason: 'overloaded', until: t + s.overloadCooldownMs };
+    return { reason: 'overloaded', until: t + escalatedMs(s.overloadCooldownMs, strike, s) };
   }
   return null;
 }
@@ -115,37 +144,77 @@ function classify(error) {
 /** Record a failed attempt on a model. */
 function recordFailure(model, error) {
   if (!model || settings().enabled === false) return null;
-  const verdict = classify(error);
+  const strike = strikes.get(model) || 0;
+  const verdict = classify(error, strike);
   if (!verdict) return null;
+  if (verdict.reason === 'overloaded' || verdict.reason === 'silent') strikes.set(model, strike + 1);
   const map = load();
   const prev = map.get(model);
   // Never shorten a longer skip (e.g. a 503 while already out for the day).
   if (prev && prev.until > verdict.until) return prev;
   map.set(model, verdict);
-  logger.info('Model will be skipped for now', { model, reason: verdict.reason, until: new Date(verdict.until).toISOString() });
+  logger.info('Model will be skipped for now', { model, reason: verdict.reason, strike: strike + 1, until: new Date(verdict.until).toISOString() });
   if (PERSISTED.has(verdict.reason)) save();
+  notify();
   return verdict;
 }
 
 /** A model answered: it's healthy again. */
 function recordSuccess(model) {
+  strikes.delete(model);
   const map = load();
   const prev = map.get(model);
   if (!prev) return;
   map.delete(model);
   logger.info('Model healthy again', { model, was: prev.reason });
   if (PERSISTED.has(prev.reason)) save();
+  notify();
 }
 
-/** The model's current skip entry, or null. */
+/**
+ * The model's current skip entry, or null. A probe-managed model whose skip
+ * has ended stays skipped ({..., awaitingProbe: true}) until a probe or a
+ * request succeeds.
+ */
 function status(model) {
   const e = load().get(model);
   if (!e) return null;
   if (e.until <= now()) {
+    if (probeModels.has(model)) return { ...e, awaitingProbe: true };
     entries.delete(model);
     return null;
   }
   return e;
+}
+
+/** Models (from the probe set) whose skip has ended and that should be probed now. */
+function dueForProbe() {
+  return [...probeModels].filter(m => {
+    const e = status(m);
+    return !!(e && e.awaitingProbe);
+  });
+}
+
+/** Which models are probe-managed (the normal answer chain). */
+function setProbeModels(models) {
+  probeModels = new Set(models || []);
+  notify();
+}
+
+/** Every current skip entry: [{model, reason, until, awaitingProbe, strike}]. */
+function snapshot() {
+  const out = [];
+  for (const model of [...load().keys()]) {
+    const e = status(model);
+    if (e) out.push({ model, reason: e.reason, until: e.until, awaitingProbe: !!e.awaitingProbe, strike: strikes.get(model) || 0 });
+  }
+  return out;
+}
+
+/** Called after any skip is added or cleared. Returns an unsubscribe function. */
+function onChange(fn) {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
 }
 
 /**
@@ -169,9 +238,15 @@ function order(models) {
 /** Test hooks: clear everything (memory + saved file), and fake the clock. */
 function reset() {
   entries = new Map();
+  strikes.clear();
+  probeModels = new Set();
   try { fs.rmSync(resolveStatePath(), { force: true }); } catch (_) { /* ignore */ }
 }
 function _setNow(fn) { now = fn || (() => Date.now()); }
 function _reload() { entries = null; }
 
-module.exports = { order, recordFailure, recordSuccess, status, classify, nextPacificMidnight, reset, _setNow, _reload };
+module.exports = {
+  order, recordFailure, recordSuccess, status, classify, nextPacificMidnight,
+  dueForProbe, setProbeModels, snapshot, onChange,
+  reset, _setNow, _reload,
+};

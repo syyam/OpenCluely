@@ -8,6 +8,7 @@ const responseLanguage = require("./src/core/response-language");
 const framework = require("./src/core/framework");
 const codeFormats = require("./src/core/code-formats");
 const speechVocab = require("./src/core/speech-vocab");
+const systemDesign = require("./src/core/system-design");
 
 // Expansions offered under a finished answer in the overlay, plus
 // 'convert:<format id>' ones (src/core/code-formats.js) checked per answer.
@@ -117,7 +118,10 @@ const llmService = require("./src/services/llm.service");
 // Managers
 const windowManager = require("./src/managers/window.manager");
 const sessionManager = require("./src/managers/session.manager");
+const { ModelMonitor } = require("./src/services/model-monitor");
 const { promptLoader } = require("./prompt-loader");
+// "CLARIFY: Did you mean …?" detection, shared with interviewer answers.
+const { clarifyState: clarifyKind, clarifyQuestion } = require("./src/core/answer-format");
 
 class ApplicationController {
   constructor() {
@@ -143,10 +147,20 @@ class ApplicationController {
     this._utteranceDispatchInFlight = false;
     this._utteranceCoalesceMs = 800;
 
+    // Bumped by resetConversation(). A request remembers the value it started
+    // with; if a clear happened while it was answering, its question/answer
+    // pair is not saved (see recordTurn), so a cleared chat stays cleared.
+    this._sessionGen = 0;
+    // A "Did you mean …?" question waiting for its reply in the chat window
+    // (see askClarification / withClarificationReply).
+    this._pendingClarification = null;
+
     // "More details": finished answers that can be expanded on demand, keyed
     // by their UI messageId (see rememberResponse/requestMoreDetails).
     this._responseRecords = new Map();
-    this._maxResponseRecords = 30;
+    // Records are small text, except screenshot buffers: only the newest
+    // MAX_IMAGE_RECORDS keep their images (older ones expand from their text).
+    this._maxResponseRecords = 200;
     this._expansionsRequested = new Set();
 
     // First-run onboarding: detects missing .env / API key and triggers
@@ -319,6 +333,11 @@ class ApplicationController {
       });
 
       sessionManager.addEvent("Application started");
+
+      // Background model health checks + the model status line in the chat
+      // window. Probes the answer chain right away, so the first question
+      // already goes to a model known to answer.
+      this.startModelMonitor();
     } catch (error) {
       this.starting = false;
       logger.error("Application initialization failed", {
@@ -445,10 +464,20 @@ class ApplicationController {
   }
 
   setupServiceEventHandlers() {
-    // Read per transcription, so profile/framework changes apply to the next question.
-    speechService.setWhisperPromptProvider(() =>
-      speechVocab.getWhisperPrompt(this.activeSkill, framework.getFramework())
-    );
+    // Read per transcription, so profile/framework changes apply to the next
+    // question. The names in the latest answer (its code and inline code) go
+    // last, so a follow-up about that code isn't misheard as sound-alikes.
+    let termsFor = null;
+    let terms = [];
+    speechService.setWhisperPromptProvider(() => {
+      const last = sessionManager.getConversationHistory(2).filter(e => e.role === 'model').pop();
+      const text = last ? last.content + (last.latestCode && last.latestCode.code ? '\n' + last.latestCode.code : '') : '';
+      if (text !== termsFor) {
+        termsFor = text;
+        terms = speechVocab.extractTerms(text);
+      }
+      return speechVocab.getWhisperPrompt(this.activeSkill, framework.getFramework(), terms);
+    });
 
     speechService.on("recording-started", () => {
       windowManager.handleRecordingStarted();
@@ -459,7 +488,16 @@ class ApplicationController {
     });
 
     speechService.on("transcription", (text, meta) => {
-      logger.debug("Transcription received", { source: meta && meta.source ? meta.source : "meeting" });
+      const source = meta && meta.source ? meta.source : "meeting";
+      logger.debug("Transcription received", { source });
+      // My Microphone is the candidate's own voice: it goes into the chat
+      // input box to edit and send by hand, never straight to Gemini.
+      // Meeting Audio keeps the automatic transcribe → answer flow.
+      if (source === "mic") {
+        const clean = String(text || "").trim();
+        if (clean) this.sendToChatWindow("mic-transcript-to-input", { text: clean });
+        return;
+      }
       this.handleTranscriptionFragment(text);
     });
 
@@ -665,8 +703,7 @@ class ApplicationController {
     });
 
     ipcMain.handle("clear-session-memory", () => {
-      sessionManager.clear();
-      windowManager.broadcastToAllWindows("session-cleared");
+      this.resetConversation();
       return { success: true };
     });
 
@@ -680,7 +717,25 @@ class ApplicationController {
       return { success: true, results };
     });
 
-    ipcMain.handle("send-chat-message", async (event, text) => {
+    // System design round mode (chat header toggle, src/core/system-design.js):
+    // in memory for one round. Every change is broadcast as
+    // "system-design-state" so the chat card always shows the current state.
+    ipcMain.handle("toggle-system-design", (event, on) => {
+      systemDesign.setOn(typeof on === "boolean" ? on : !systemDesign.isOn());
+      logger.info("System design mode", { on: systemDesign.isOn(), skill: this.activeSkill });
+      this.broadcastSystemDesign();
+      return systemDesign.getState();
+    });
+    ipcMain.handle("get-system-design-state", () => systemDesign.getState());
+    ipcMain.handle("build-system-design", () => {
+      if (!systemDesign.isOn()) return { success: false, error: "System design mode is off" };
+      // No problem statement yet: the model would invent one (2026-10-11).
+      if (!systemDesign.getState().problem) return { success: false, error: "No design problem yet" };
+      this.buildSystemDesign();
+      return { success: true };
+    });
+
+    ipcMain.handle("send-chat-message", async (event, text, options = {}) => {
       // Not added to session memory here — processWithLLM records it once,
       // paired with its answer, after the request completes.
 
@@ -691,7 +746,9 @@ class ApplicationController {
       (async () => {
         try {
           const sessionHistory = sessionManager.getOptimizedHistory();
-          await this.processWithLLM(text, sessionHistory);
+          await this.processWithLLM(this.withClarificationReply(text), sessionHistory, {
+            spoken: !!(options && options.spoken)
+          });
         } catch (error) {
           logger.error("Failed to process chat message with LLM", {
             error: error.message,
@@ -714,8 +771,17 @@ class ApplicationController {
       }
     });
 
-    ipcMain.handle("request-more-details", (event, messageId, mode) => {
-      return this.requestMoreDetails(messageId, mode);
+    ipcMain.handle("request-more-details", (event, messageId, mode, fallback) => {
+      return this.requestMoreDetails(messageId, mode, fallback);
+    });
+
+    // Model status line (chat window): current state, and "Try now".
+    ipcMain.handle("get-model-status", () => {
+      return this.modelMonitor ? this.modelMonitor.status() : null;
+    });
+    ipcMain.handle("probe-model", async (event, model) => {
+      if (!this.modelMonitor) return { ok: false, error: "not started" };
+      return this.modelMonitor.probe(model || this.modelMonitor.chain()[0]);
     });
 
     ipcMain.handle("get-skill-prompt", (event, skillName) => {
@@ -1085,12 +1151,141 @@ class ApplicationController {
 
   clearSessionMemory() {
     try {
-      sessionManager.clear();
-      windowManager.broadcastToAllWindows("session-cleared");
+      this.resetConversation();
       logger.info("Session memory cleared via global shortcut");
     } catch (error) {
       logger.error("Error clearing session memory:", error);
     }
+  }
+
+  /**
+   * Forget the conversation (chat trash button and Ctrl+Shift+\). Only the
+   * question/answer history goes: profile, resume, language, Japanese mode
+   * and knowledge are untouched. Voice fragments not yet sent are dropped,
+   * and answers still streaming won't be saved when they finish.
+   */
+  resetConversation() {
+    sessionManager.clear();
+    this._sessionGen++;
+    if (this._utteranceTimer) {
+      clearTimeout(this._utteranceTimer);
+      this._utteranceTimer = null;
+    }
+    this._utteranceBuffer = "";
+    this._pendingClarification = null;
+    // The round's requirements and design lived in that history, so they go
+    // too — also while the mode is paused, so switching it on starts fresh.
+    systemDesign.reset();
+    this.broadcastSystemDesign();
+    windowManager.broadcastToAllWindows("session-cleared");
+  }
+
+  broadcastSystemDesign() {
+    windowManager.broadcastToAllWindows("system-design-state", systemDesign.getState());
+  }
+
+  /**
+   * System design mode: update the round (requirements card in the
+   * requirement stage, current diagram once built) from a finished answer
+   * that was saved to history. Nothing happens when the mode is off.
+   */
+  afterSystemDesignAnswer(gen, question, llmResult) {
+    if (!systemDesign.isOn() || gen !== this._sessionGen || !llmResult) return;
+    const meta = llmResult.metadata || {};
+    if (meta.usedFallback) return;
+    const changed = systemDesign.afterAnswer({
+      question,
+      response: llmResult.response,
+      reqLines: meta.reqLines || null
+    });
+    if (changed) this.broadcastSystemDesign();
+  }
+
+  /**
+   * "Build design" (chat card): the requirements gathered so far become the
+   * design request, answered on the reasoning chain (3.8-flash first). The
+   * stage switches to 'built' before the request so its system prompt has
+   * the design layout; a failed build goes back to requirement gathering.
+   */
+  async buildSystemDesign() {
+    if (!systemDesign.isOn() || this._systemDesignBuilding) return;
+    this._systemDesignBuilding = true;
+    const before = systemDesign.getStage();
+    try {
+      const text = systemDesign.buildDesignRequestText(this.activeSkill);
+      systemDesign.setStage("built");
+      this.broadcastSystemDesign();
+      logger.info("System design: building the design", { skill: this.activeSkill, requirements: systemDesign.formatRequirements().split("\n").length });
+      // Three or four diagrams + walkthroughs, and thinking tokens count toward
+      // the limit: more room than Deep reasoning's 8192.
+      const ok = await this.processWithLLM(text, sessionManager.getOptimizedHistory(), { reasoning: { maxOutputTokens: 24576 } });
+      if (!ok && systemDesign.isOn()) {
+        systemDesign.setStage(before);
+        this.broadcastSystemDesign();
+      }
+    } finally {
+      this._systemDesignBuilding = false;
+    }
+  }
+
+  /**
+   * The chat answer was a "CLARIFY: Did you mean …?" line: show it in the
+   * chat window only and remember the question, so the next chat message
+   * ("yes", or the word that was meant) is sent together with it. Nothing is
+   * saved to history. If the response window had already been opened (only
+   * possible when a retry turned into a question), it is closed again.
+   * source 'voice': an interviewer coding request (Meeting Audio) — asked
+   * the same way, and the reply builds the interviewer's request.
+   */
+  askClarification(question, response, gen, responseWindowOpened, source = 'chat') {
+    const ask = clarifyQuestion(response);
+    this._pendingClarification = { question, ask, gen, source };
+    if (responseWindowOpened) windowManager.hideLLMResponse();
+    logger.info("Request needs a clarification; asked in the chat window", { ask, source });
+    this.sendToChatWindow("chat-clarification", { text: ask, source });
+  }
+
+  /**
+   * A "why didn't you use X?" answer ended with "IMPLEMENT: <change>" (already
+   * stripped by llm.service): show the change in the chat window with an
+   * "Implement this" button. A click sends it as a normal chat message, so it
+   * becomes a regular coding follow-up with the full code.
+   */
+  sendImplementOffer(llmResult, gen) {
+    const offer = llmResult && llmResult.metadata && llmResult.metadata.implementOffer;
+    if (!offer || gen !== this._sessionGen) return;
+    logger.info("Answer offers a code change; shown in the chat window", { offer });
+    this.sendToChatWindow("chat-implement-offer", { text: offer, messageId: llmResult.metadata.messageId });
+  }
+
+  /**
+   * The next chat message after a "Did you mean …?" question is the reply to
+   * it: send the reply with the question and the original message, so a bare
+   * "yes" or a single word is understood. Used once, then cleared.
+   */
+  withClarificationReply(text) {
+    const pending = this._pendingClarification;
+    this._pendingClarification = null;
+    if (!pending || pending.gen !== this._sessionGen) return text;
+    const about = pending.source === 'voice'
+      ? `about the interviewer's request (a live speech transcript, so a word may be misheard): "${pending.question}". If it confirms, build that request with your suggestion (a change to earlier code is a follow-up: the smallest change, marked CHANGED:)`
+      : `about my previous message: "${pending.question}". If it confirms, answer that message with your suggestion`;
+    return `${String(text || '').trim()}\n\n[This answers your question "${pending.ask}" ${about}; if it gives the word I meant, use it; if it's a new question, just answer it.]`;
+  }
+
+  /**
+   * Save a finished question/answer pair to session memory, unless the
+   * conversation was cleared while it was being answered (gen is the
+   * _sessionGen the request started with). Returns the model event id, or
+   * null when the pair was not saved.
+   */
+  recordTurn(gen, question, source, response, metadata) {
+    if (gen !== this._sessionGen) {
+      logger.info("Answer finished after a conversation clear; not saved to history", { source });
+      return null;
+    }
+    sessionManager.addUserInput(question, source);
+    return sessionManager.addModelResponse(response, metadata);
   }
 
   handleUpArrow() {
@@ -1176,6 +1371,7 @@ class ApplicationController {
   async processImagesWithLLM(images, { text = '', source = 'screenshot' } = {}) {
     const startTime = Date.now();
     const typed = String(text || '').trim();
+    const gen = this._sessionGen;
 
     try {
       windowManager.showLLMLoading();
@@ -1211,8 +1407,7 @@ class ApplicationController {
       // Record a user turn for the screenshot too, so later requests (which
       // now include history) see question → answer pairs.
       const label = images.length > 1 ? `[Screenshots ×${images.length}]` : '[Screenshot]';
-      sessionManager.addUserInput(typed ? `${label} ${typed}` : label, source);
-      const eventId = sessionManager.addModelResponse(llmResult.response, {
+      const eventId = this.recordTurn(gen, typed ? `${label} ${typed}` : label, source, llmResult.response, {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
@@ -1225,6 +1420,7 @@ class ApplicationController {
         programmingLanguage,
         images
       });
+      if (eventId) this.afterSystemDesignAnswer(gen, typed || label, llmResult);
 
       this.broadcastTranscriptionLLMResponse(llmResult);
 
@@ -1310,7 +1506,8 @@ class ApplicationController {
     return { ok: true };
   }
 
-  async processWithLLM(text, sessionHistory) {
+  async processWithLLM(text, sessionHistory, { spoken = false, reasoning = false } = {}) {
+    const gen = this._sessionGen;
     try {
       // The question is deliberately NOT in session memory yet: the request
       // builder reads history and appends the current question itself, so
@@ -1319,11 +1516,20 @@ class ApplicationController {
 
       this._responseSeq = (this._responseSeq || 0) + 1;
       const messageId = `chat-${Date.now()}-${this._responseSeq}`;
-      windowManager.broadcastToAllWindows("transcription-llm-response-start", {
-        messageId,
-        skill: this.activeSkill
-      });
-      windowManager.showLLMLoading();
+
+      // The response window opens only once the answer is known not to be a
+      // "CLARIFY: Did you mean …?" question (those go to the chat window and
+      // the previous answer stays on screen). Only the first few characters
+      // are held back for that.
+      let state = 'pending'; // → 'answer' | 'clarify'
+      let held = '';
+      const openResponseWindow = () => {
+        windowManager.broadcastToAllWindows("transcription-llm-response-start", {
+          messageId,
+          skill: this.activeSkill
+        });
+        windowManager.showLLMLoading();
+      };
 
       const llmResult = await llmService.processTextWithSkillStream(
         text,
@@ -1331,14 +1537,38 @@ class ApplicationController {
         sessionHistory.recent,
         needsProgrammingLanguage ? this.promptLanguage() : null,
         (delta) => {
+          if (state === 'pending') {
+            held += delta;
+            const kind = clarifyKind(held);
+            if (kind === 'maybe') return;
+            if (kind === 'yes') { state = 'clarify'; return; }
+            state = 'answer';
+            openResponseWindow();
+            delta = held;
+          }
+          if (state !== 'answer') return;
           windowManager.broadcastToAllWindows("transcription-llm-response-chunk", {
             messageId,
             delta
           });
         },
-        () => windowManager.broadcastToAllWindows("transcription-llm-response-reset", { messageId })
+        () => {
+          if (state === 'answer') {
+            windowManager.broadcastToAllWindows("transcription-llm-response-reset", { messageId });
+          } else {
+            state = 'pending';
+            held = '';
+          }
+        },
+        { spoken, reasoning }
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
+
+      if (clarifyKind(llmResult.response) === 'yes') {
+        this.askClarification(text, llmResult.response, gen, state === 'answer');
+        return false;
+      }
+      if (state !== 'answer') openResponseWindow(); // non-streamed fallback or a very short answer
 
       logger.info("LLM processing completed, showing response", {
         responseLength: llmResult.response.length,
@@ -1349,8 +1579,7 @@ class ApplicationController {
       });
 
       // Record the question/answer pair once, now that the request is done.
-      sessionManager.addUserInput(text, 'chat');
-      const eventId = sessionManager.addModelResponse(llmResult.response, {
+      const eventId = this.recordTurn(gen, text, 'chat', llmResult.response, {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
@@ -1361,8 +1590,10 @@ class ApplicationController {
         question: text,
         programmingLanguage: needsProgrammingLanguage ? this.promptLanguage() : null
       });
+      if (eventId) this.afterSystemDesignAnswer(gen, text, llmResult);
 
       this.broadcastTranscriptionLLMResponse(llmResult);
+      this.sendImplementOffer(llmResult, gen);
 
       windowManager.showLLMResponse(llmResult.response, {
         skill: this.activeSkill,
@@ -1371,6 +1602,7 @@ class ApplicationController {
         messageId: llmResult.metadata.messageId,
         formats
       });
+      return !llmResult.metadata.usedFallback;
     } catch (error) {
       logger.error("LLM processing failed", {
         error: error.message,
@@ -1389,6 +1621,7 @@ class ApplicationController {
       });
 
       this.broadcastLLMError(error.message);
+      return false;
     }
   }
 
@@ -1469,6 +1702,7 @@ class ApplicationController {
     // bubble the streaming start event created; otherwise a total failure
     // leaves an empty streamed bubble stranded next to the fallback message.
     let messageId = null;
+    const gen = this._sessionGen;
     try {
       // Validate input text
       if (!text || typeof text !== 'string' || text.trim().length === 0) {
@@ -1495,6 +1729,14 @@ class ApplicationController {
 
       const needsProgrammingLanguage = promptLoader.requiresProgrammingLanguage(this.activeSkill);
 
+      // A new interviewer question replaces an unanswered "Did you mean …?"
+      // about the previous one: its buttons would otherwise build the old
+      // request with no context.
+      if (this._pendingClarification && this._pendingClarification.source === 'voice') {
+        this._pendingClarification = null;
+        this.sendToChatWindow("chat-clarification-expired", {});
+      }
+
       // Stream the answer progressively to the configured speech target.
       // A unique messageId ties the start/chunk/final events to one bubble so
       // the UI never duplicates or interleaves concurrent responses.
@@ -1507,6 +1749,26 @@ class ApplicationController {
       if (this.shouldShowVoiceOverlay()) {
         windowManager.showLLMLoading();
       }
+      // "Heard X → answered as Y": the interviewer's words were answered as a
+      // different term. Shown once in the chat window so a wrong guess is easy
+      // to spot and correct there; the answer itself is not held up.
+      let heardSent = false;
+      const sendHeard = (note) => {
+        if (!note || heardSent) return;
+        heardSent = true;
+        this.sendToChatWindow("voice-heard-note", { text: note, messageId });
+      };
+      // Asked once: early from the stream (a HEARD note with other readings
+      // on a coding answer, see llm.service) or when the reply was a question.
+      let asked = false;
+      const askNow = (question) => {
+        if (asked) return;
+        asked = true;
+        this.sendToVoiceResponseWindows("transcription-llm-response-cancel", { messageId });
+        if (gen === this._sessionGen) {
+          this.askClarification(cleanText, question, gen, false, 'voice');
+        }
+      };
       const llmResult = await llmService.processTranscriptionWithIntelligentResponseStream(
         cleanText,
         this.activeSkill,
@@ -1518,14 +1780,23 @@ class ApplicationController {
             delta
           });
         },
-        () => this.sendToVoiceResponseWindows("transcription-llm-response-reset", { messageId })
+        () => this.sendToVoiceResponseWindows("transcription-llm-response-reset", { messageId }),
+        { onHeard: (note) => sendHeard(note), onClarify: (question) => askNow(question) }
       );
       llmResult.metadata = { ...llmResult.metadata, messageId };
 
+      // A coding request with a genuinely unclear term: nothing was
+      // streamed. Drop the empty answer row (the previous answer stays) and
+      // ask in the chat window; the reply builds it. Not saved to history.
+      if (llmResult.metadata.clarify) {
+        askNow(llmResult.metadata.clarify);
+        return;
+      }
+      sendHeard(llmResult.metadata.heard);
+
       // Record the question/answer pair once, now that the request is done
       // (the question was not in history while the request was built).
-      sessionManager.addUserInput(cleanText, 'speech');
-      const eventId = sessionManager.addModelResponse(llmResult.response, {
+      const eventId = this.recordTurn(gen, cleanText, 'speech', llmResult.response, {
         skill: this.activeSkill,
         processingTime: llmResult.metadata.processingTime,
         usedFallback: llmResult.metadata.usedFallback,
@@ -1537,6 +1808,7 @@ class ApplicationController {
         question: cleanText,
         programmingLanguage: needsProgrammingLanguage ? this.promptLanguage() : null
       });
+      if (eventId) this.afterSystemDesignAnswer(gen, cleanText, llmResult);
 
       this.sendTranscriptionLLMResponseToVoiceTargets(llmResult);
       if (this.shouldShowVoiceOverlay()) {
@@ -1549,6 +1821,7 @@ class ApplicationController {
           formats
         });
       }
+      this.sendImplementOffer(llmResult, gen);
 
       logger.info("Transcription LLM response completed", {
         responseLength: llmResult.response.length,
@@ -1574,8 +1847,7 @@ class ApplicationController {
           fallbackResult.metadata = { ...fallbackResult.metadata, messageId };
         }
 
-        sessionManager.addUserInput(String(text || '').trim(), 'speech');
-        sessionManager.addModelResponse(fallbackResult.response, {
+        this.recordTurn(gen, String(text || '').trim(), 'speech', fallbackResult.response, {
           skill: this.activeSkill,
           processingTime: fallbackResult.metadata.processingTime,
           usedFallback: true,
@@ -1739,11 +2011,35 @@ class ApplicationController {
       : [];
     this._responseRecords.set(messageId, {
       ...details,
+      prevQuestion: this._previousQuestion(details && details.eventId),
       answer: llmResult.response,
       skill: this.activeSkill,
       framework: codingFramework,
       formats
     });
+    this._trimResponseRecords();
+    return formats;
+  }
+
+  /**
+   * The user question asked before the answer event `eventId` (the turn
+   * before it), so an expansion of a follow-up like "I meant for Speeqr"
+   * gets the same notes as the answer did. '' when there is none.
+   */
+  _previousQuestion(eventId) {
+    const memory = sessionManager.sessionMemory || [];
+    const idx = eventId ? memory.findIndex(e => e.id === eventId) : -1;
+    let seenOwn = false;
+    for (let i = idx - 1; idx >= 0 && i >= 0; i--) {
+      if (memory[i].role !== 'user' || typeof memory[i].content !== 'string') continue;
+      if (seenOwn) return memory[i].content;
+      seenOwn = true;
+    }
+    return '';
+  }
+
+  _trimResponseRecords() {
+    const MAX_IMAGE_RECORDS = 10;
     while (this._responseRecords.size > this._maxResponseRecords) {
       const oldest = this._responseRecords.keys().next().value;
       this._responseRecords.delete(oldest);
@@ -1751,7 +2047,53 @@ class ApplicationController {
         if (key.startsWith(`${oldest}:`)) this._expansionsRequested.delete(key);
       }
     }
-    return formats;
+    const withImages = [...this._responseRecords.values()].filter(r => Array.isArray(r.images) && r.images.length);
+    for (const r of withImages.slice(0, Math.max(0, withImages.length - MAX_IMAGE_RECORDS))) r.images = [];
+  }
+
+  /**
+   * The overlay still shows an answer whose record is gone (evicted, or the
+   * session was cleared): rebuild one from the answer text it sent, using
+   * session memory for its question when that answer is still there, so the
+   * button works instead of saying "unavailable". Current profile/language/
+   * framework are used for anything the answer doesn't tell us.
+   */
+  rebuildResponseRecord(messageId, answer) {
+    const text = String(answer || '').trim();
+    if (!text) return null;
+    const memory = sessionManager.sessionMemory || [];
+    let idx = -1;
+    for (let i = memory.length - 1; i >= 0; i--) {
+      const e = memory[i];
+      if (e.role === 'model' && typeof e.content === 'string' && e.content.trim() === text) { idx = i; break; }
+    }
+    const event = idx >= 0 ? memory[idx] : null;
+    let question = '';
+    for (let i = idx - 1; idx >= 0 && i >= 0; i--) {
+      if (memory[i].role === 'user') { question = String(memory[i].content || ''); break; }
+      if (memory[i].role === 'model') break;
+    }
+    const isImage = /^\[Screenshots?/.test(question);
+    if (isImage) question = question.replace(/^\[Screenshots?[^\]]*\]\s*/, '');
+    const skill = (event && event.skill) || this.activeSkill;
+    const codingFramework = framework.getFramework();
+    const record = {
+      eventId: event ? event.id : null,
+      kind: isImage ? 'image' : 'chat',
+      question,
+      prevQuestion: event ? this._previousQuestion(event.id) : '',
+      programmingLanguage: promptLoader.requiresProgrammingLanguage(skill) ? this.promptLanguage() : null,
+      images: [],
+      answer: text,
+      skill,
+      framework: codingFramework,
+      formats: framework.offersWebFrameworks(skill) ? codeFormats.conversionOptions(text, codingFramework) : [],
+      rebuilt: true
+    };
+    this._responseRecords.set(messageId, record);
+    this._trimResponseRecords();
+    logger.info("Expansion record rebuilt from the overlay's answer", { messageId, foundInSession: !!event });
+    return record;
   }
 
   /**
@@ -1765,17 +2107,23 @@ class ApplicationController {
    * and it's sent only while that answer is still the latest one
    * (LLMService._historyContents).
    */
-  requestMoreDetails(parentMessageId, mode = 'details') {
+  requestMoreDetails(parentMessageId, mode = 'details', fallback = null) {
     const convertId = String(mode).startsWith('convert:') ? mode.slice(8) : null;
     if (!EXPANSION_MODES.includes(mode) && !convertId) {
       return { ok: false, reason: 'unavailable' };
     }
-    const record = this._responseRecords.get(parentMessageId);
+    let record = this._responseRecords.get(parentMessageId);
+    if (!record && fallback && typeof fallback.answer === 'string') {
+      record = this.rebuildResponseRecord(parentMessageId, fallback.answer);
+    }
     // "Optimized solution" only makes sense for an answer that has code; a
-    // conversion only for a format offered under that answer. "More details"
-    // and "Deep reasoning" work on any answer.
+    // conversion only for a format offered under that answer (a rebuilt
+    // record: any known format, since the button came from the original).
+    // "More details" and "Deep reasoning" work on any answer.
+    const formatOffered = convertId && ((record && record.formats) || []).some(f => f.id === convertId);
+    const formatKnown = convertId && record && record.rebuilt && !!codeFormats.getFormat(convertId);
     if (!record || (mode === 'optimized' && !/```/.test(record.answer)) ||
-        (convertId && !(record.formats || []).some(f => f.id === convertId))) {
+        (convertId && !formatOffered && !formatKnown)) {
       return { ok: false, reason: 'unavailable' };
     }
     const requestKey = `${parentMessageId}:${mode}`;
@@ -1872,7 +2220,17 @@ class ApplicationController {
     }
   }
 
+  startModelMonitor() {
+    if (this.modelMonitor) return;
+    this.modelMonitor = new ModelMonitor(llmService);
+    this.modelMonitor.on("status", (status) => {
+      windowManager.broadcastToAllWindows("model-status", status);
+    });
+    this.modelMonitor.start();
+  }
+
   onWillQuit() {
+    if (this.modelMonitor) this.modelMonitor.stop();
     globalShortcut.unregisterAll();
     speechService.shutdown();
     windowManager.destroyAllWindows();
@@ -2083,6 +2441,7 @@ class ApplicationController {
         try {
           llmService.initializeClient();
           logger.info("LLM service reinitialized after Gemini key update");
+          if (this.modelMonitor) this.modelMonitor.refresh();
         } catch (e) {
           logger.warn("Failed to reinitialize LLM service after Gemini key update", {
             error: e.message
@@ -2097,6 +2456,7 @@ class ApplicationController {
         try {
           config.set("llm.gemini.model", envUpdates.GEMINI_MODEL);
           llmService.initializeClient();
+          if (this.modelMonitor) this.modelMonitor.refresh();
           logger.info("LLM service reinitialized after Gemini model change", {
             model: envUpdates.GEMINI_MODEL
           });

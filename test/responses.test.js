@@ -13,7 +13,7 @@ const modelHealth = env.req('src/core/model-health');
 const responseLanguage = env.req('src/core/response-language');
 
 const NORMAL = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.1-flash-lite-preview'];
-const REASONING = ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+const REASONING = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
 const CODE = '### Solution — Sum\n```\nfun sum(a: Int, b: Int) = a + b // (1) add\n```';
 const record = (over = {}) => ({ kind: 'chat', question: 'Sum two numbers', answer: CODE, skill: 'android', programmingLanguage: 'kotlin', framework: 'auto', ...over });
 const failAll = (models, n = 3) => models.forEach(m => fake.script(m, ...Array(n).fill({ status: 503, body: fake.errorEvent() })));
@@ -100,7 +100,7 @@ test('total failure on a normal answer → canned "could you repeat" reply (Engl
 });
 
 for (const mode of ['deep', 'optimized']) {
-  test(`${mode}: reasoning chain 3.6 → 3.5-lite → 3.1-lite with medium thinking and 8192 tokens`, async () => {
+  test(`${mode}: reasoning chain 3.8 → 3.6 → 3.5-lite → 3.1-lite with medium thinking and 8192 tokens`, async () => {
     fake.script(REASONING[0], { status: 503, body: fake.errorEvent() });
     fake.script(REASONING[1], fake.sse('### Solution — Sum (reviewed)\n```\nfun sum(a: Int, b: Int) = a + b\n```'));
     const r = await llm.processExpansionStream(record(), null, mode);
@@ -114,6 +114,48 @@ for (const mode of ['deep', 'optimized']) {
     }
   });
 }
+
+test('deep: a silent reasoning primary is hedged — the backup starts after reasoning.hedgeAfterMs and wins', async () => {
+  const prev = config.get('llm.gemini.reasoning.hedgeAfterMs');
+  config.set('llm.gemini.reasoning.hedgeAfterMs', 100);
+  try {
+    fake.script(REASONING[0], { ...fake.sse('late primary'), firstDelayMs: 800 });
+    fake.script(REASONING[1], fake.sse('Backup review.'));
+    const t0 = Date.now();
+    const r = await llm.processExpansionStream(record({ answer: 'A plain answer.' }), null, 'deep');
+    assert.equal(r.response, 'Backup review.');
+    assert.ok(Date.now() - t0 < 700, 'did not wait for the silent primary');
+    assert.deepEqual(fake.models().slice(0, 2), REASONING.slice(0, 2));
+    assert.equal(modelHealth.status(REASONING[0]).reason, 'silent', 'primary skipped next time');
+  } finally {
+    config.set('llm.gemini.reasoning.hedgeAfterMs', prev);
+  }
+});
+
+test('deep: a reasoning primary whose skip ended but has no successful probe yet is not tried', async () => {
+  modelHealth.setProbeModels([...NORMAL, ...REASONING]);
+  const t0 = Date.now();
+  modelHealth._setNow(() => t0);
+  try {
+    modelHealth.recordFailure(REASONING[0], new Error('HTTP 503 UNAVAILABLE high demand'));
+    modelHealth._setNow(() => t0 + 3 * 60 * 1000); // past the 2 min skip
+    fake.script(REASONING[1], fake.sse('From the backup.'));
+    const r = await llm.processExpansionStream(record({ answer: 'A plain answer.' }), null, 'deep');
+    assert.equal(r.response, 'From the backup.');
+    assert.ok(!fake.models().includes(REASONING[0]), '3.8-flash waits for the background probe');
+  } finally {
+    modelHealth._setNow(null);
+  }
+});
+
+test('probe: a reasoning-only model is probed with minimal thinking, a normal model with budget 0', async () => {
+  fake.script(REASONING[0], fake.sse('hi'));
+  fake.script('gemini-3.1-flash-lite', fake.sse('hi'));
+  assert.equal((await llm.probeModel(REASONING[0])).ok, true);
+  assert.equal((await llm.probeModel('gemini-3.1-flash-lite')).ok, true);
+  assert.deepEqual(fake.requests[0].body.generationConfig.thinkingConfig, { thinkingLevel: 'minimal' });
+  assert.deepEqual(fake.requests[1].body.generationConfig.thinkingConfig, { thinkingBudget: 0 });
+});
 
 test('details and convert stay on the normal model (fast path)', async () => {
   fake.script(NORMAL[0], fake.sse('More depth.'));
@@ -153,14 +195,14 @@ test('not initialized (no API key) → clear error on every entry point', async 
   }
 });
 
-test('today\'s case: 3.6-flash out of daily quota → the next Deep/Optimized go straight to 3.5-flash-lite (medium)', async () => {
-  const daily = { status: 429, body: { error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Quota exceeded … limit: 20, model: gemini-3.6-flash. Please retry in 27s.', details: [{ violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }] }] } } };
+test('today\'s case: the reasoning primary (3.8-flash) out of daily quota → the next Deep/Optimized go straight to 3.6-flash (medium)', async () => {
+  const daily = { status: 429, body: { error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Quota exceeded … limit: 20, model: gemini-3.8-flash. Please retry in 27s.', details: [{ violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }] }] } } };
   fake.script(REASONING[0], daily);
   fake.script(REASONING[1], fake.sse('First deep review.'), fake.sse('Second deep review.'), fake.sse('Optimized version.'));
   await llm.processExpansionStream(record(), null, 'deep');
   await llm.processExpansionStream(record({ question: 'another' }), null, 'deep');
   await llm.processExpansionStream(record(), null, 'optimized');
-  assert.deepEqual(fake.models(), [REASONING[0], REASONING[1], REASONING[1], REASONING[1]], '3.6 asked once, then skipped');
+  assert.deepEqual(fake.models(), [REASONING[0], REASONING[1], REASONING[1], REASONING[1]], '3.8 asked once, then skipped');
   for (const q of fake.requests.slice(1)) assert.deepEqual(q.body.generationConfig.thinkingConfig, { thinkingLevel: 'medium' });
   assert.equal(env.findLogs('Skipping models for now').length, 2);
 });
@@ -171,4 +213,16 @@ test('normal answers are untouched while only the reasoning model is out', async
   const r = await llm.processTextWithSkillStream('q', 'frontend', [], 'typescript', null);
   assert.equal(r.response, 'Normal answer.');
   assert.deepEqual(fake.models(), [NORMAL[0]]);
+});
+
+test('a coding answer without an Approach section is logged (no retry); prose and full answers are not', async () => {
+  const noApproach = '### Solution — Sum\n```kotlin\nfun sum(a: Int, b: Int) = a + b // (1) add\n```\n**Implementation**\n(1) adds';
+  const withApproach = '### Solution — Sum\n**Approach**\n**Key idea:** add them.\n1. I add a and b.\n```kotlin\nfun sum(a: Int, b: Int) = a + b // (1) add\n```';
+  fake.script(NORMAL[0], fake.sse(noApproach), fake.sse(withApproach), fake.sse('A closure captures scope.'));
+  assert.equal((await llm.processTextWithSkillStream('sum two numbers', 'android', [], 'kotlin')).response.includes('fun sum'), true);
+  assert.equal(env.findLogs('Coding answer missing Approach').length, 1);
+  assert.equal(fake.requests.length, 1, 'not retried');
+  await llm.processTextWithSkillStream('sum two numbers', 'android', [], 'kotlin');
+  await llm.processTextWithSkillStream('What is a closure?', 'android', [], 'kotlin');
+  assert.equal(env.findLogs('Coding answer missing Approach').length, 1, 'only the first answer was flagged');
 });

@@ -7,12 +7,13 @@ delete this file to switch the bank off after the interview. -->
 ## Exercise A — Vue 3 search interface (main task)
 id: ex-a-task
 group: exercise-a
-keys: !vue 3 search, !search interface, !fake backend, !index html, search box, search input, user selection, select a user, select user, list of users, vue 3, vue cdn, single file, search, vue, view
+keys: !vue 3 search, !search interface, !fake backend, !fake api, !index html, search box, search input, user selection, select a user, select user, list of users, vue 3, vue cdn, single file, search, vue, view, api, fetch*, name*, users
+need: search*, fake*
 Task: build a Vue 3 search UI in one `index.html` (Vue 3 from CDN, `createApp`), a fake backend, and selecting a user from the results.
 - Fake backend: `fakeSearch(query, { signal })` returns a Promise that resolves after a **random delay** (e.g. 200-1500 ms) with users whose name includes the query. The random latency is deliberate, because it makes out-of-order responses possible. It must honor `signal`: on `abort` it clears its timer and rejects with `new DOMException('Aborted', 'AbortError')`.
 - State: `query`, `results`, `loading`, `error`. Render the input with `v-model`, the loading and error states, and a list with `v-for` + `:key="user.id"`. Only when the question asks for selecting a user: a `selectedUser` set on click, showing its details. An empty query clears the results without a request.
-- Search logic: a `watch(query, ...)` calls a **debounced** search function (created once). Each search **aborts the previous request** with `AbortController`, ignores `AbortError`, and only then writes `results`.
-- Keep it a single, runnable `index.html`. Mention how you'd test it: type fast, watch that stale results never win.
+- Search logic: a `watch(query, ...)` calls the search function and writes `results`, with loading/error handling and the empty-query guard. Debounce and cancelling the previous request (`AbortController`) go in only when the task statement asks for them; otherwise they are the usual next follow-ups (see the race / abort / debounce entries), so name them under possible improvements instead of building them upfront.
+- Write the template lines and the `createApp`/`setup()` script as they go inside the given `index.html` (Vue already loaded from the CDN); the full page (head, the Vue `<script src>`) only when asked. Mention how you'd test it: type fast, watch that stale results never win.
 
 ## Exercise A follow-up — race condition in search
 id: ex-a-race
@@ -33,7 +34,7 @@ keys: !cancel the previous request, !cancel the old, abort controller, abort, ca
 - On every new search: `controller?.abort()` → `controller = new AbortController()` → pass `controller.signal` to `fetch` (or to the fake backend).
 - The aborted promise rejects with `AbortError`: `catch (e) { if (e.name === 'AbortError') return; error.value = e.message }`, so it is not shown as an error and doesn't clear loading for the newer request.
 - A fake backend must support it: `signal.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Aborted', 'AbortError')) })`, and check `signal.aborted` up front.
-- Also abort on unmount (`onBeforeUnmount(() => controller?.abort())`), and set loading only for the latest request.
+- Also abort on unmount (`onBeforeUnmount(() => controller?.abort())`), and set loading only for the latest request: keep this request's controller in a local `const c = new AbortController(); controller = c`, and in `finally` clear loading only `if (controller === c)`. (Checking `controller.signal.aborted` there is a bug: by then `controller` may already be the newer request's.)
 - Abort cancels the *client side*; the server may still process the request, which is fine for idempotent GET searches.
 
 ## Exercise A follow-up — implement debounce manually (no lodash)
@@ -88,41 +89,78 @@ keys: !expect x, !implement tobe, tobe, to be y, expect, closure, matcher, asser
     };
   }
   ```
+- **Closure:** `toBe` runs later, after `expect` has returned, and still reads `actual` because the returned object closes over it.
 - Use `Object.is`, the same as Jest's `toBe`: unlike `===`, `Object.is(NaN, NaN)` is `true` and `Object.is(0, -0)` is `false`. For objects it compares **references**, not content.
 - Throw on failure (a test runner catches it); returning true/false is also acceptable if the interviewer asks for that.
+- Typing: `actual: unknown` / `expected: unknown` rather than `any` — nothing is done with the values except compare them, and `unknown` stops accidental property access.
+- This is the whole first step. `not`, `toEqual` and deep equality are the usual follow-ups, not part of this answer.
 
 ## Exercise B follow-up — add not.toBe
 id: ex-b-not
 group: exercise-b
 keys: !not tobe, !not to be, negat*, not, invert, opposite
-- Return a `not` property on the same object that reuses the same comparison with the result inverted. Keep one shared helper so the logic isn't duplicated:
+- Smallest change: keep `toBe` exactly as it is and add a `not` object next to it with its own `toBe` that fails when the values **are** the same:
   ```js
   function expect(actual) {
-    const make = (negate) => ({
-      toBe(expected) {
-        const pass = Object.is(actual, expected);
-        if (pass === negate) {
-          throw new Error(`Expected ${String(actual)} ${negate ? 'not ' : ''}to be ${String(expected)}`);
-        }
-        return true;
+    return {
+      toBe(expected) { /* unchanged */ },
+      not: {
+        toBe(expected) {
+          if (Object.is(actual, expected)) {
+            throw new Error(`Expected ${String(actual)} not to be ${String(expected)}`);
+          }
+          return true;
+        },
       },
-    });
-    return { ...make(false), not: make(true) };
+    };
   }
   ```
-- The closure still captures `actual`, and `negate` is captured per matcher set, so every future matcher (`toEqual`, ...) gets `not` for free.
+- `not` is a plain property holding another object, so `expect(5).not.toBe(6)` is just a property access and a method call. The inner `toBe` still reads `actual` through the same closure.
+- Possible improvement only if asked (e.g. once there are several matchers): build both sets from one `makeMatchers(negate)` helper so every new matcher gets `not` for free, or expose `not` as a getter (`get not() { … }`) so it's only built when used.
+
+## Exercise B follow-up — NaN, === vs Object.is
+id: ex-b-nan
+group: exercise-b
+keys: !object is, !nan, strict equality, triple equals, same value, samevalue, negative zero, signed zero
+- `===` (strict equality) and `Object.is` (the SameValue algorithm) agree on everything except two cases:
+  - `NaN === NaN` is `false`, but `Object.is(NaN, NaN)` is `true`.
+  - `0 === -0` is `true`, but `Object.is(0, -0)` is `false`.
+- `===` isn't "wrong": it follows the IEEE 754 number comparison rules (NaN is unequal to everything, +0 equals -0). `Object.is` asks a different question, "is this the same value?", which is what an assertion wants.
+- So `expect(NaN).toBe(NaN)` should pass. With `Object.is` it already does; with `===` it would fail, and switching the comparison to `Object.is` is a one-line change.
+- For objects both compare **references**, so neither makes `{a: 1}` equal `{a: 1}` (that's `toEqual`).
 
 ## Exercise B follow-up — add toEqual for objects
 id: ex-b-toequal
 group: exercise-b
-keys: !implement toequal, !add toequal, !add a toequal, toequal, to equal, deep equal, deep equality, objects, compare objects, recursive
-- `toBe` checks identity; `toEqual` checks **structure** with a recursive deep-equality function:
-  - `Object.is(a, b)` → true (covers primitives and NaN).
-  - If either one isn't an object or is `null` → false.
-  - Arrays: both arrays and same length; for objects: same own keys (`Object.keys` length and every key present).
-  - Recurse on every value.
-- Mention edge cases briefly: `Date`/`RegExp` (compare `getTime()` / `toString()`), `Map`/`Set`, circular references (track visited pairs in a `WeakMap`), `undefined` properties (Jest's `toEqual` ignores them, `toStrictEqual` doesn't).
-- Plug it into the same `make(negate)` helper so `not.toEqual` works too.
+keys: !implement toequal, !add toequal, !add a toequal, toequal, to equal, compare objects, by value, objects
+- **Reference vs value:** `{a: 1} === {a: 1}` is `false` — two object literals are two different objects in memory, and `===`/`Object.is` compare references. `toEqual` compares **structure** instead.
+- First step, one level (shallow) — add a small `isEqual(a, b)` and a `toEqual` matcher next to `toBe`, leaving `toBe` unchanged:
+  - `Object.is(a, b)` → true (primitives, NaN, the same reference).
+  - If either one isn't an object or is `null` → false (**`typeof null === 'object'`**, so `null` needs its own check).
+  - Same number of own keys (`Object.keys`), every key of `a` also exists in `b` (`Object.hasOwn(b, key)` — otherwise `{a: undefined}` would equal `{b: undefined}`), and the two values are `Object.is`-equal.
+- Add `not.toEqual` only if `not` already exists in the code (mirror what was done for `toBe`).
+- Nested objects, recursion and special types are the next follow-ups — leave them out of this step.
+
+## Exercise B follow-up — deep equality for nested objects
+id: ex-b-deep
+group: exercise-b
+keys: !nested object*, !deep equal*, !deep equality, !make it recursive, nested, shallow, deep, recursive, recursion
+need: equal*, toequal, isequal, object*
+- **Recursion:** a nested object is the same problem one level down, so the per-key check changes from `Object.is(a[k], b[k])` to `isEqual(a[k], b[k])` — the function calls itself. The `Object.is` / non-object checks at the top are the base case that stops it.
+- **Arrays are objects** in JavaScript, so the same key loop works for them (indexes are keys); add `Array.isArray(a) !== Array.isArray(b)` → false so `[1]` doesn't equal `{0: 1}`.
+- Keep everything else unchanged; this is usually a one- or two-line change to `isEqual`.
+
+## Exercise B follow-up — what other cases should deep equality handle
+id: ex-b-edge-cases
+group: exercise-b
+keys: !other cases, !what else, !edge cases, !circular, date, regexp, map, set, cycl*, undefined, prototype
+need: equal*, toequal, isequal, deep
+- Mention, don't implement unless asked:
+  - `Date` (compare `getTime()`), `RegExp` (compare `source` and `flags`).
+  - `Map`/`Set` (same size, compare entries — keys of a plain object loop don't see their contents).
+  - Circular references (`a.self = a`): recursion never ends → track visited pairs in a `WeakMap`.
+  - `undefined` properties: Jest's `toEqual` treats `{a: undefined}` like `{}`; `toStrictEqual` doesn't. Also different prototypes / class instances.
+  - Key order doesn't matter (`Object.keys` + lookup), and `NaN` inside objects already works because of `Object.is`.
 
 ## Exercise C — Vue Options API: render a list from 1 to N
 id: ex-c-options-list
@@ -241,7 +279,7 @@ keys: !typescript, !type script, !ts, types, typing, generics, type safety
 ## State sharing between micro-frontends
 id: q-singlespa-state
 group: architecture
-keys: !share state, !sharing state, !shared state, !state sharing, !single spa, !singlespa, micro frontend*, microfrontend*, between apps, module federation, root config, parcels
+keys: !share state, !sharing state, !shared state, !state sharing, single spa, micro frontend*, microfrontend*, between apps, module federation, root config, parcels
 - Principle: keep micro-frontends **loosely coupled**. Share as little state as possible, and only through explicit contracts, not one global Redux / Pinia store that every app imports (that recreates a monolith and couples deploys).
 - Options, from least to most coupled:
   1. **URL / routing** as shared state (the current item, search params).

@@ -43,7 +43,8 @@ test('click → requestMoreDetails(id, mode), button loading + disabled, second 
   deepBtn.click();
   deepBtn.click();
   await ov.wait(10);
-  assert.deepEqual(ov.calls.filter(c => c[0] === 'requestMoreDetails'), [['requestMoreDetails', 'm1', 'deep']]);
+  // The answer text rides along so main can rebuild an evicted record.
+  assert.equal(JSON.stringify(ov.calls.filter(c => c[0] === 'requestMoreDetails')), JSON.stringify([['requestMoreDetails', 'm1', 'deep', { answer: 'Answer.' }]]));
   assert.equal(deepBtn.textContent, 'Reasoning deeply…');
   assert.equal(deepBtn.disabled, true);
   assert.equal(ov.buttons('m1').find(b => b.dataset.mode === 'details').disabled, false, 'other buttons stay usable');
@@ -110,6 +111,19 @@ test('reset clears the partial text of a live answer; the retry streams into the
   assert.equal(ov.rows().length, 1);
 });
 
+test('cancel (the request became a chat question): the empty row and the badge go, the previous answer stays and the next one keeps its number', async () => {
+  display('First answer.', { messageId: 'm1' });
+  ov.emit('onShowLoading');
+  start('m2');
+  assert.equal(ov.rows().length, 2);
+  ov.emit('onTranscriptionLlmResponseCancel', { messageId: 'm2' });
+  assert.equal(ov.rows().length, 1);
+  assert.match(ov.row('m1').textContent, /First answer\./);
+  assert.equal(ov.loadingVisible(), false);
+  start('m3');
+  assert.match(ov.row('m3').textContent, /#2/);
+});
+
 test('reset before a pending chunk flush drops that chunk too', async () => {
   start('m1');
   chunk('m1', 'unflushed half');
@@ -143,4 +157,29 @@ test('solution sections: Solution / Improved / Optimized each get prose beside t
   const { preamble, sections: split } = ov.window.splitSolutionSections('Intro\n## Optimized — C\nx\n```js\n### Solution — not a heading\n```');
   assert.equal(preamble.trim(), 'Intro');
   assert.equal(split.length, 1, 'headings inside code fences are ignored');
+});
+
+test('Implementation points render as separate bullets whatever marker the model used', async () => {
+  const impl = (points) => `### Solution — Sum\n**Approach**\n1. I add them.\n\`\`\`ts\nconst s = a + b // (1) add\nreturn s // (2) return\n\`\`\`\n**Implementation**\n${points}\n**Complexity** O(1)`;
+  const cases = {
+    bare: '(1) `a + b` adds.\n(2) `return s` returns.',
+    bold: '**(1)** `a + b` adds.\n**(2)** `return s` returns.',
+    dashed: '- (1) `a + b` adds.\n- (2) `return s` returns.',
+  };
+  for (const [name, points] of Object.entries(cases)) {
+    display(impl(points), { messageId: name });
+    const items = [...ov.row(name).querySelectorAll('li')].map(li => li.textContent);
+    assert.ok(items.some(t => /\(1\).*adds/.test(t)) && items.some(t => /\(2\).*returns/.test(t)), `${name}: ${JSON.stringify(items)}`);
+    assert.ok(!items.some(t => /adds[\s\S]*returns/.test(t)), `${name}: points merged into one item`);
+    // The number is the marker: no bullet dot in front of "(1)".
+    const numbered = [...ov.row(name).querySelectorAll('li')].filter(li => /^\s*\(\d\)/.test(li.textContent));
+    assert.ok(numbered.length >= 2 && numbered.every(li => li.classList.contains('numbered-point')), `${name}: numbered points keep a bullet`);
+    assert.ok(numbered[0].parentElement.classList.contains('numbered-points'));
+  }
+  // A plain bullet next to numbered points keeps its dot.
+  display(impl('- (1) `a + b` adds.\n- (2) `return s` returns.\n- Uses a const, so nothing is mutated.'), { messageId: 'mixed' });
+  const plain = [...ov.row('mixed').querySelectorAll('li')].find(li => /Uses a const/.test(li.textContent));
+  assert.ok(!plain.classList.contains('numbered-point'));
+  // Lines inside code fences are never touched.
+  assert.equal(ov.window.separateListsFromParagraphs('```\n(1) x\n```'), '```\n(1) x\n```');
 });

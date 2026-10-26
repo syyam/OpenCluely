@@ -8,36 +8,41 @@
 // Which format is the DEFAULT for a framework is prompt text and lives in
 // framework.js getFrameworkDefaultsBlock; this file only converts.
 
+// Vue "CDN" formats are the code as it goes inside a page that already loads
+// Vue — what an interviewer reads — not a full HTML document. A complete
+// page is written only when the question asks for one (framework.js).
+const IN_PAGE = 'no page boilerplate (no `<!DOCTYPE>`, `<html>`, `<head>`, `<meta>`, `<title>`, `<body>` or Vue `<script src>`), and no SFC syntax (no `<template>` tag, no `export default`, no `import`) — a component the page needs is registered with a `template:` string: only the `<div id="app">` template lines the code uses, then a `<script>` with';
+
 const FORMATS = {
   // Vue 3
   'vue-composition-sfc': {
     family: 'vue3', label: 'Composition API + SFC', script: 'typed',
-    describe: 'a Vue 3 single-file component (.vue) with the Composition API — `<script setup>` + `<template>` — fenced ```vue',
+    describe: 'a Vue 3 single-file component (.vue) with the Composition API — only `<script setup>` (with the imports it uses) + `<template>`, no `<style>` block or app/mount code — fenced ```vue',
   },
   'vue-options-sfc': {
     family: 'vue3', label: 'Options API + SFC', script: 'typed',
-    describe: 'a Vue 3 single-file component (.vue) with the Options API — `export default { data(), computed, watch, methods, lifecycle hooks }` (wrapped in `defineComponent` when the script is TypeScript) + `<template>` — fenced ```vue',
+    describe: 'a Vue 3 single-file component (.vue) with the Options API — `export default { data(), computed, watch, methods, lifecycle hooks }` (wrapped in `defineComponent` when the script is TypeScript) + `<template>`, no `<style>` block or app/mount code — fenced ```vue',
   },
   'vue-composition-cdn': {
     family: 'vue3', label: 'Composition API + CDN', script: 'browser',
-    describe: 'one complete HTML page that loads Vue 3 from a CDN (`https://unpkg.com/vue@3/dist/vue.global.js`), with the template inside the `#app` element and `Vue.createApp({ setup() { …; return { … } } }).mount(\'#app\')` using `Vue.ref`/`Vue.computed`/`Vue.watch` — fenced ```html',
+    describe: `the code as it goes inside an \`index.html\` that already loads Vue 3 from a CDN (\`Vue\` is a global), with the Composition API — ${IN_PAGE} \`const { createApp, ref, computed, watch } = Vue\` (only what's used), any helper functions, and \`createApp({ setup() { …; return { … } } }).mount('#app')\` — fenced \`\`\`html`,
   },
   'vue-options-cdn': {
     family: 'vue3', label: 'Options API + CDN', script: 'browser',
-    describe: 'one complete HTML page that loads Vue 3 from a CDN (`https://unpkg.com/vue@3/dist/vue.global.js`), with the template inside the `#app` element and `Vue.createApp({ data(), computed, watch, methods }).mount(\'#app\')` — fenced ```html',
+    describe: `the code as it goes inside an \`index.html\` that already loads Vue 3 from a CDN (\`Vue\` is a global), with the Options API — ${IN_PAGE} \`const { createApp } = Vue\` and \`createApp({ data() { … }, computed: { … }, watch: { … }, methods: { … } }).mount('#app')\` — fenced \`\`\`html`,
   },
   // Vue 2
   'vue2-options-sfc': {
     family: 'vue2', label: 'Vue 2 Options API + SFC', script: 'javascript',
-    describe: 'a Vue 2 single-file component (.vue) with the Options API — `export default { data(), computed, watch, methods, lifecycle hooks }` + a `<template>` with a single root element — fenced ```vue',
+    describe: 'a Vue 2 single-file component (.vue) with the Options API — `export default { data(), computed, watch, methods, lifecycle hooks }` + a `<template>` with a single root element, no `<style>` block or app/mount code — fenced ```vue',
   },
   'vue2-options-cdn': {
     family: 'vue2', label: 'Vue 2 Options API + CDN', script: 'browser',
-    describe: 'one complete HTML page that loads Vue 2 from a CDN (`https://unpkg.com/vue@2/dist/vue.js`), with the template inside the `#app` element and `new Vue({ el: \'#app\', data, computed, watch, methods })` — fenced ```html',
+    describe: `the code as it goes inside an \`index.html\` that already loads Vue 2 from a CDN (\`Vue\` is a global), with the Options API — ${IN_PAGE} \`new Vue({ el: '#app', data() { … }, computed: { … }, watch: { … }, methods: { … } })\` — fenced \`\`\`html`,
   },
   'vue2-composition-sfc': {
     family: 'vue2', label: 'Vue 2.7 Composition API + SFC', script: 'javascript',
-    describe: 'a Vue 2.7 single-file component (.vue) with the Composition API — `<script setup>` importing `ref`/`computed`/`watch` from \'vue\' + a `<template>` with a single root element — fenced ```vue',
+    describe: 'a Vue 2.7 single-file component (.vue) with the Composition API — `<script setup>` importing `ref`/`computed`/`watch` from \'vue\' + a `<template>` with a single root element, no `<style>` block or app/mount code — fenced ```vue',
   },
   // React
   'react-tsx': {
@@ -60,7 +65,7 @@ const FORMATS = {
 
 // Frameworks whose answers never get conversions (their code shares React/Vue
 // signals, but a CDN/class rewrite of a Next/Nuxt/React Native app makes no sense).
-const NO_CONVERSION_FRAMEWORKS = new Set(['nextjs', 'nuxt', 'react-native']);
+const NO_CONVERSION_FRAMEWORKS = new Set(['dsa', 'nextjs', 'nuxt', 'react-native']);
 
 function codeOf(answer) {
   const blocks = [];
@@ -112,7 +117,8 @@ function detectFormat(answer, frameworkSetting) {
 
   if (vueScore >= reactScore) {
     const vue2 = frameworkSetting === 'vue2' || /\bnew Vue\s*\(/.test(code) || /vue@2/.test(code);
-    const cdn = /\bVue\.createApp\b|\bnew Vue\s*\(|=\s*Vue\s*;?\s*$/m.test(code) || /src=["'][^"']*\bvue(@[\d.]+)?\//.test(code);
+    // CDN = the in-page form (the default) or a full page that loads Vue itself.
+    const cdn = /\bcreateApp\s*\(|\bnew Vue\s*\(|=\s*Vue\s*;?\s*$/m.test(code) || /src=["'][^"']*\bvue(@[\d.]+)?\//.test(code);
     const composition = /<script[^>]*\bsetup\b/.test(code) || /\bsetup\s*\(/.test(code);
     const options = /\bdata\s*\(\s*\)\s*\{|\bdata\s*:\s*(function|\(|\{)|\b(methods|computed|watch)\s*:\s*\{/.test(code);
     const style = composition ? 'composition' : options ? 'options' : null;
@@ -159,8 +165,9 @@ function getConvertNote(id, programmingLanguage) {
 ## Format Conversion Request (overrides the answer formats above for this message)
 The conversation contains the original question and the solution already given. Rewrite that same solution as ${f.describe}.
 - Port it, don't redesign it: same behavior, logic, names, edge cases and handling as the given solution; change only what this format requires (how state, lifecycle, imports, the template and mounting are written). No new features, state, mock data or optimizations.
-- Script language: ${scriptLanguage(f, programmingLanguage)}.
-- Use the same Coding answer format with the heading \`### Solution — ${f.label}\`. Understanding: one line saying this is the same solution as ${f.label}. Keep the same Approach steps, the same numbered \`(n)\` comments on the matching lines and the same Implementation points (reword one only where this format does it differently). No CHANGED markers.
+- Script language: ${scriptLanguage(f, programmingLanguage)}.${/complete HTML page/.test(f.describe) ? `
+- This button asks for the full runnable page (overrides "No page boilerplate" above): \`<!DOCTYPE html>\`, \`<html>\`, a \`<head>\` with the framework's CDN \`<script src>\`, and a \`<body>\` holding the markup and the script, so it runs when saved as \`index.html\`.` : ''}
+- Use the same Coding answer format with the heading \`### Solution — ${f.label}\`. Understanding: one line saying this is the same solution as ${f.label}. Keep the same Key idea and Approach steps (Approach is required — if the given solution lacks them, write them now), the same numbered \`(n)\` comments on the matching lines and the same Implementation points (reword one only where this format does it differently). A logical step this format adds with no counterpart (e.g. mounting the app on a CDN page) gets the next number and its own Implementation point. No CHANGED markers.
 - Complete code, not a diff.`;
 }
 

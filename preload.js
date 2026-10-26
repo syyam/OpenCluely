@@ -34,10 +34,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getLLMSessionHistory: () => ipcRenderer.invoke('get-llm-session-history'),
   clearSessionMemory: () => ipcRenderer.invoke('clear-session-memory'),
   formatSessionHistory: () => ipcRenderer.invoke('format-session-history'),
-  sendChatMessage: (text) => ipcRenderer.invoke('send-chat-message', text),
+  // options.spoken: the text came from My Microphone (see chat.html)
+  sendChatMessage: (text, options) => ipcRenderer.invoke('send-chat-message', text, options || {}),
   // { text, images: [{ data: ArrayBuffer, mimeType }] } — screenshots attached in chat
   sendChatAttachments: (payload) => ipcRenderer.invoke('send-chat-attachments', payload),
   getSkillPrompt: (skillName) => ipcRenderer.invoke('get-skill-prompt', skillName),
+
+  // System design round mode (chat header toggle + requirements card)
+  toggleSystemDesign: (on) => ipcRenderer.invoke('toggle-system-design', on),
+  getSystemDesignState: () => ipcRenderer.invoke('get-system-design-state'),
+  buildSystemDesign: () => ipcRenderer.invoke('build-system-design'),
+  onSystemDesignState: (callback) => ipcRenderer.on('system-design-state', callback),
   
   // Gemini LLM configuration
   setGeminiApiKey: (apiKey) => ipcRenderer.invoke('set-gemini-api-key', apiKey),
@@ -117,13 +124,32 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onLlmResponse: (callback) => ipcRenderer.on('llm-response', callback),
   onLlmError: (callback) => ipcRenderer.on('llm-error', callback),
   onTranscriptionLlmResponse: (callback) => ipcRenderer.on('transcription-llm-response', callback),
+  // My Microphone transcript → chat input box (sent by hand, not to Gemini)
+  onMicTranscriptToInput: (callback) => ipcRenderer.on('mic-transcript-to-input', callback),
+  // "Did you mean …?" for a chat coding request, answered by the next message
+  onChatClarification: (callback) => ipcRenderer.on('chat-clarification', callback),
+  // An interviewer "Did you mean …?" was replaced by a newer question
+  onChatClarificationExpired: (callback) => ipcRenderer.on('chat-clarification-expired', callback),
+  // Interviewer's words answered as a different term: "a → b"
+  onVoiceHeardNote: (callback) => ipcRenderer.on('voice-heard-note', callback),
+  // A "why didn't you use X?" answer offers that change: "Implement this" button.
+  onChatImplementOffer: (callback) => ipcRenderer.on('chat-implement-offer', callback),
   onTranscriptionLlmResponseStart: (callback) => ipcRenderer.on('transcription-llm-response-start', callback),
   onTranscriptionLlmResponseChunk: (callback) => ipcRenderer.on('transcription-llm-response-chunk', callback),
   // A streamed attempt broke off; discard its partial text (a retry follows).
   onTranscriptionLlmResponseReset: (callback) => ipcRenderer.on('transcription-llm-response-reset', callback),
+  // The interviewer's request turned into a "Did you mean …?" in chat: drop
+  // the empty answer row it started.
+  onTranscriptionLlmResponseCancel: (callback) => ipcRenderer.on('transcription-llm-response-cancel', callback),
   // "More details" (AI Response overlay only)
   // mode: 'details' (default) or 'optimized'
-  requestMoreDetails: (messageId, mode) => ipcRenderer.invoke('request-more-details', messageId, mode),
+  // fallback: {answer} — the answer text, used when main no longer holds
+  // the answer's record (it keeps a limited number).
+  requestMoreDetails: (messageId, mode, fallback) => ipcRenderer.invoke('request-more-details', messageId, mode, fallback),
+  // Model status line (chat window)
+  getModelStatus: () => ipcRenderer.invoke('get-model-status'),
+  probeModel: (model) => ipcRenderer.invoke('probe-model', model),
+  onModelStatus: (callback) => ipcRenderer.on('model-status', callback),
   onMoreDetailsFailed: (callback) => ipcRenderer.on('more-details-failed', callback),
   onOpenGeminiConfig: (callback) => ipcRenderer.on('open-gemini-config', callback),
   onDisplayLlmResponse: (callback) => ipcRenderer.on('display-llm-response', callback),

@@ -55,6 +55,9 @@
         .markdown-content p { margin-bottom: 0.8rem; color: white; font-size: 0.95rem; }
         .markdown-content ul, .markdown-content ol { margin-bottom: 0.8rem; padding-left: 1.2rem; font-size: 0.95rem; }
         .markdown-content li { margin-bottom: 0.4rem; color: white; font-size: 0.95rem; }
+        /* "(1) …" Implementation points: the number is the marker, no bullet */
+        .markdown-content li.numbered-point { list-style: none; }
+        .markdown-content ul.numbered-points { padding-left: 0; }
         .markdown-content code {
             background-color: rgba(0, 0, 0, 0.4);
             padding: 0.2rem 0.4rem;
@@ -550,6 +553,88 @@
             height: calc(100vh - 32px);
         }
 
+        /* ```mermaid diagram (system design mode): its own box in the code
+           column. Drag / Ctrl+wheel / Fit act on this box only; code blocks
+           and the overlay's own scrolling are untouched. */
+        .diagram-block .diagram-header {
+            -webkit-app-region: no-drag;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+            font-weight: bold;
+        }
+        .diagram-block .diagram-title { margin-right: auto; }
+        .diagram-btn {
+            background: rgba(0, 0, 0, 0.35);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            color: #d1d5db;
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-size: 0.72rem;
+            font-family: inherit;
+            cursor: pointer;
+        }
+        .diagram-btn:hover { background: rgba(255, 255, 255, 0.12); color: #fff; }
+        .diagram-btn.active { border-color: #64ffda; color: #64ffda; background: rgba(100, 255, 218, 0.12); }
+        .diagram-btn.copied { border-color: #22c55e; color: #22c55e; }
+        .diagram-view {
+            position: relative;
+            height: min(440px, 62vh);
+            overflow: hidden;
+            background-color: rgba(0, 0, 0, 0.25);
+            border-radius: 0 0 0.5rem 0.5rem;
+            cursor: grab;
+            touch-action: none;
+            user-select: none;
+        }
+        .diagram-view.dragging { cursor: grabbing; }
+        .diagram-stage {
+            position: absolute;
+            left: 0;
+            top: 0;
+            transform-origin: 0 0;
+            will-change: transform;
+        }
+        .diagram-stage svg { display: block; max-width: none !important; }
+        .diagram-status {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #9ca3af;
+            font-size: 0.8rem;
+        }
+        .diagram-note {
+            padding: 0.4rem 0.75rem;
+            font-size: 0.75rem;
+            color: #fbbf24;
+            background: rgba(251, 191, 36, 0.08);
+        }
+        .diagram-block .diagram-code[hidden], .diagram-block .diagram-view[hidden], .diagram-note[hidden] { display: none; }
+        /* The large view starts below the 32px window header: that header is
+           a window drag region, and Electron gives drag regions priority over
+           anything drawn on top of them, so buttons there missed clicks. */
+        .diagram-block.expanded {
+            position: fixed;
+            inset: 40px 8px 8px 8px;
+            -webkit-app-region: no-drag;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            background: #111827;
+            border-radius: 0.5rem;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+        }
+        .diagram-block.expanded .diagram-view { height: auto; flex: 1; background-color: #0b1020; }
+        .diagram-block.expanded .diagram-code { flex: 1; overflow: auto; }
+        /* Changed / new nodes in a design follow-up (```mermaid :::changed) */
+        .diagram-stage .changed > rect,
+        .diagram-stage .changed > path,
+        .diagram-stage .changed > polygon,
+        .diagram-stage .changed > circle { stroke: #facc15 !important; stroke-width: 2.5px !important; }
+
         .copy-btn {
             position: absolute;
             top: 6px;
@@ -722,6 +807,15 @@
                             handleStreamChunk(data && typeof data === 'object' ? data : {});
                         } catch (err) {
                             console.error('[LLM-RESPONSE] Error handling stream chunk:', err);
+                        }
+                    });
+                }
+                if (typeof window.electronAPI.onTranscriptionLlmResponseCancel === 'function') {
+                    window.electronAPI.onTranscriptionLlmResponseCancel((event, data) => {
+                        try {
+                            handleStreamCancel(data && typeof data === 'object' ? data : {});
+                        } catch (err) {
+                            console.error('[LLM-RESPONSE] Error handling stream cancel:', err);
                         }
                     });
                 }
@@ -1039,14 +1133,17 @@
         // clicks locally, on top of main's own duplicate check.
         const moreDetailsState = new Map();
 
-        function requestMoreDetails(parentMessageId, mode) {
+        // `answer`: the answer's text, sent along so main can rebuild the
+        // request if it no longer holds that answer (it keeps a limited number).
+        function requestMoreDetails(parentMessageId, mode, answer) {
             mode = expansionMode(mode);
             const key = `${parentMessageId}:${mode}`;
             if (!parentMessageId || moreDetailsState.has(key)) return;
             if (!window.electronAPI || typeof window.electronAPI.requestMoreDetails !== 'function') return;
             moreDetailsState.set(key, 'loading');
             setMoreDetailsButtonState(parentMessageId, 'loading', mode);
-            window.electronAPI.requestMoreDetails(parentMessageId, mode).then((result) => {
+            const fallback = typeof answer === 'string' && answer.trim() ? { answer } : undefined;
+            window.electronAPI.requestMoreDetails(parentMessageId, mode, fallback).then((result) => {
                 if (result && result.ok) return;
                 if (result && result.reason === 'unavailable') {
                     setMoreDetailsButtonState(parentMessageId, 'unavailable', mode);
@@ -1151,6 +1248,28 @@
             }, STREAM_FLUSH_MS);
         }
 
+        // The interviewer's request became a "Did you mean …?" question in
+        // the chat window, so no answer comes: remove the empty row it
+        // started and its number, and the loading badge. The previous answer
+        // stays as it was.
+        function handleStreamCancel(data) {
+            if (!data || !data.messageId) return;
+            hideLoadingState();
+            const entry = liveEntries.get(data.messageId);
+            if (!entry) return;
+            if (entry.flushTimer) clearTimeout(entry.flushTimer);
+            liveEntries.delete(data.messageId);
+            const wasLast = lastResponseRowEl === entry.rowEl;
+            entry.rowEl.remove();
+            if (wasLast) {
+                responseIndex = Math.max(0, responseIndex - 1);
+                const rows = document.querySelectorAll('#entries .response-entry:not(.expansion)');
+                lastResponseRowEl = rows.length ? rows[rows.length - 1] : null;
+                if (!rows.length) isFirstResponseEver = true;
+                hideNewResponseIndicator();
+            }
+        }
+
         // A streamed attempt broke off mid-answer (e.g. Gemini's mid-stream
         // 503) and main is retrying on the next model: drop the partial text
         // so the retry streams into an empty row instead of after half an
@@ -1181,6 +1300,9 @@
             const codeBlocks = extractCodeBlocks(response).filter(b => !INLINE_FENCE_TAGS.has(b.language.toLowerCase()));
             const hasCodeLocal = codeBlocks.length > 0;
             hasCode = hasCodeLocal;
+            // A ```mermaid diagram sits in the code column but isn't code to
+            // optimize or convert.
+            const hasRealCode = codeBlocks.some(b => b.language.toLowerCase() !== 'mermaid');
             const isExpansion = !!meta.parentMessageId;
 
             const entry = document.createElement('div');
@@ -1270,8 +1392,8 @@
             if (meta.messageId && !meta.usedFallback && (!isExpansion || isConverted)) {
                 const footer = document.createElement('div');
                 footer.className = 'entry-footer';
-                const modes = hasCodeLocal ? ['details', 'deep', 'optimized'] : ['details', 'deep'];
-                if (hasCodeLocal && Array.isArray(meta.formats)) {
+                const modes = hasRealCode ? ['details', 'deep', 'optimized'] : ['details', 'deep'];
+                if (hasRealCode && Array.isArray(meta.formats)) {
                     meta.formats.forEach(f => {
                         if (!f || !f.id) return;
                         formatLabels.set(f.id, f.label || f.id);
@@ -1286,7 +1408,7 @@
                     btn.textContent = expansionInfo(mode).button;
                     btn.addEventListener('click', (e) => {
                         e.stopPropagation();
-                        requestMoreDetails(meta.messageId, mode);
+                        requestMoreDetails(meta.messageId, mode, response);
                     });
                     footer.appendChild(btn);
                 });
@@ -1485,21 +1607,39 @@
             const textEl = document.createElement('div');
             textEl.className = 'markdown-content entry-text';
             textEl.innerHTML = renderMarkdown(cleaned);
+            markNumberedPoints(textEl);
             body.appendChild(textEl);
             parent.appendChild(body);
             if (window.renderMathInElement) window.renderMathInElement(textEl);
             return body;
         }
 
+        // Implementation points "(1) …" are list items so each gets its own
+        // line, but their number is the marker: drop the bullet dot so they
+        // don't read "• (1) …". Plain bullets keep their dot.
+        function markNumberedPoints(root) {
+            root.querySelectorAll('li').forEach(li => {
+                if (/^\s*\(\d+[a-z]?\)/.test(li.textContent)) li.classList.add('numbered-point');
+            });
+            root.querySelectorAll('ul').forEach(ul => {
+                const items = [...ul.children].filter(el => el.tagName === 'LI');
+                if (items.length && items.every(li => li.classList.contains('numbered-point'))) ul.classList.add('numbered-points');
+            });
+        }
+
         // lib/markdown.js only starts a list after a blank line, but the
         // model writes "**Approach**\n1. …" — so insert that blank line
         // before a list item that directly follows a non-list line.
+        // Implementation points written as bare "(1) …" lines (no list
+        // marker) would also merge into one paragraph — make each a bullet.
         function separateListsFromParagraphs(text) {
             const listItem = /^\s*(\d+[.)]|[-*+])\s+/;
             const out = [];
             let inFence = false;
-            text.split('\n').forEach(line => {
+            text.split('\n').forEach(rawLine => {
+                let line = rawLine;
                 if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
+                else if (!inFence && /^\s*(\*\*)?\(\d+[a-z]?\)/.test(line)) line = '- ' + line.trimStart();
                 const prev = out.length ? out[out.length - 1] : '';
                 if (!inFence && listItem.test(line) && prev.trim() && !listItem.test(prev) && !/^\s/.test(prev)) {
                     out.push('');
@@ -1523,6 +1663,7 @@
         }
 
         function buildCodeBlockEl(block) {
+            if (String(block.language || '').toLowerCase() === 'mermaid') return buildDiagramEl(block);
             const codeBlock = document.createElement('div');
             codeBlock.className = 'code-block';
             codeBlock.innerHTML = `
@@ -1539,6 +1680,269 @@
             attachCopy(btn, block.code || '');
             pre.appendChild(btn);
             return codeBlock;
+        }
+
+        // ---- ```mermaid diagrams (system design mode) ----------------------
+        // mermaid.js (~3.5 MB, bundled in node_modules, works offline) is
+        // loaded the first time a diagram is shown, never for normal answers.
+        let mermaidReady = null;
+        let diagramSeq = 0;
+        function ensureMermaid() {
+            if (mermaidReady) return mermaidReady;
+            mermaidReady = new Promise((resolve, reject) => {
+                const init = () => {
+                    try {
+                        window.mermaid.initialize({
+                            startOnLoad: false,
+                            securityLevel: 'strict',
+                            theme: 'dark',
+                            flowchart: { useMaxWidth: false, htmlLabels: true, curve: 'basis' },
+                            themeVariables: { fontSize: '14px' }
+                        });
+                        resolve(window.mermaid);
+                    } catch (e) { reject(e); }
+                };
+                if (window.mermaid) return init();
+                const script = document.createElement('script');
+                script.src = './node_modules/mermaid/dist/mermaid.min.js';
+                script.onload = () => (window.mermaid ? init() : reject(new Error('mermaid did not load')));
+                script.onerror = () => reject(new Error('mermaid failed to load'));
+                document.head.appendChild(script);
+            });
+            mermaidReady.catch(() => { mermaidReady = null; });
+            return mermaidReady;
+        }
+
+        // Source as rendered: `:::changed` nodes get the highlight class.
+        // The box header: the diagram's `---\ntitle: …\n---` title, else its type.
+        function diagramTitle(code) {
+            const src = String(code || '');
+            const front = /^\s*---\s*\n([\s\S]*?)\n\s*---/.exec(src);
+            const title = front && (/^\s*title:\s*(.+)$/m.exec(front[1]) || [])[1];
+            if (title) return title.replace(/^["']|["']$/g, '').trim().toUpperCase();
+            return /^\s*sequenceDiagram\b/m.test(src) ? 'SEQUENCE' : 'DIAGRAM';
+        }
+
+        function diagramSource(code) {
+            let src = String(code || '').trim();
+            // classDef is flowchart syntax; a sequence diagram marks its
+            // changed steps with a rect block instead.
+            const flowchart = /^\s*(flowchart|graph|stateDiagram)/m.test(src);
+            if (flowchart && /:::changed\b/.test(src) && !/^\s*classDef\s+changed\b/m.test(src)) {
+                src += '\nclassDef changed fill:#3b3200,stroke:#facc15,stroke-width:2.5px,color:#fff';
+            }
+            return src;
+        }
+
+        // Common small-model slips, tried only when the source doesn't parse:
+        // unquoted labels with brackets / parentheses / numbering, e.g.
+        // API[(3) Booking API] → API["(3) Booking API"].
+        // Also: a space before :::changed (flowchart), and ; or # inside a
+        // sequence message / note, where mermaid reads ; as a statement break
+        // (both seen in live builds, 2026-10-11).
+        function repairMermaid(src) {
+            if (/^\s*sequenceDiagram\b/m.test(src)) {
+                return src.split('\n').map(line => {
+                    const m = /^(\s*(?:Note\s+(?:over|left of|right of)\s+[^:]+|[^:%]*?(?:->>|-->>|->|-->|-x|--x|-\)|--\)))\s*:)(.*)$/.exec(line);
+                    return m ? m[1] + m[2].replace(/;/g, ',').replace(/#/g, 'no.') : line;
+                }).join('\n');
+            }
+            if (!/^\s*(flowchart|graph)\b/m.test(src)) return src;
+            return src.split('\n').map(line => {
+                if (/^\s*(%%|classDef|class |style |subgraph|end\b|flowchart|graph)/.test(line)) return line;
+                return line
+                    .replace(/([\w\])}>])\s+(:::\w+)/g, '$1$2')
+                    .replace(/\b([A-Za-z][\w-]*)\[\((\d+)\)\s*([^\]"\n]*)\]/g, '$1["($2) $3"]')
+                    .replace(/\b([A-Za-z][\w-]*)\[(?![\["(\/\\])([^\]"\n]*[()|{}][^\]"\n]*)\]/g, '$1["$2"]');
+            }).join('\n');
+        }
+
+        async function drawMermaid(code) {
+            const mermaid = await ensureMermaid();
+            const attempts = [diagramSource(code)];
+            const repaired = repairMermaid(attempts[0]);
+            if (repaired !== attempts[0]) attempts.push(repaired);
+            let lastError = null;
+            for (const src of attempts) {
+                try {
+                    await mermaid.parse(src);
+                    const { svg } = await mermaid.render(`sd-diagram-${++diagramSeq}`, src);
+                    return svg;
+                } catch (e) {
+                    lastError = e;
+                }
+            }
+            throw lastError || new Error('diagram could not be drawn');
+        }
+
+        function buildDiagramEl(block) {
+            const code = String(block.code || '').replace(/\s+$/, '');
+            const el = document.createElement('div');
+            el.className = 'code-block diagram-block';
+            el.innerHTML = `
+                <div class="code-header diagram-header">
+                    <span class="diagram-title">${escapeHtml(diagramTitle(code))}</span>
+                    <button type="button" class="diagram-btn active" data-view="diagram" title="Show the drawn diagram">Diagram</button>
+                    <button type="button" class="diagram-btn" data-view="code" title="Show the Mermaid code">Code</button>
+                    <button type="button" class="diagram-btn" data-act="fit" title="Fit the diagram in the box">Fit</button>
+                    <button type="button" class="diagram-btn" data-act="expand" title="Show larger (Esc to close)">⤢</button>
+                    <button type="button" class="diagram-btn" data-act="copy" title="Copy the Mermaid code (paste into Excalidraw or draw.io)">Copy diagram</button>
+                </div>
+                <div class="diagram-note" hidden></div>
+                <div class="diagram-view" title="Drag to move · Ctrl+scroll to zoom · double-click or Fit to see it all">
+                    <div class="diagram-stage"></div>
+                    <div class="diagram-status">Drawing diagram…</div>
+                </div>
+                <div class="code-content diagram-code" hidden>
+                    <pre class="line-numbers"><code class="language-mermaid">${escapeHtml(code)}</code></pre>
+                </div>
+            `;
+            const view = el.querySelector('.diagram-view');
+            const stage = el.querySelector('.diagram-stage');
+            const status = el.querySelector('.diagram-status');
+            const note = el.querySelector('.diagram-note');
+            const codeView = el.querySelector('.diagram-code');
+            const viewButtons = el.querySelectorAll('[data-view]');
+            const fitBtn = el.querySelector('[data-act="fit"]');
+            const expandBtn = el.querySelector('[data-act="expand"]');
+            const copyBtn = el.querySelector('[data-act="copy"]');
+            let drawn = false;
+            let size = { w: 0, h: 0 };
+            const t = { scale: 1, x: 0, y: 0 };
+            const apply = () => { stage.style.transform = `translate(${t.x}px, ${t.y}px) scale(${t.scale})`; };
+
+            function showView(which) {
+                const diagram = which === 'diagram';
+                view.hidden = !diagram;
+                codeView.hidden = diagram;
+                viewButtons.forEach(b => b.classList.toggle('active', b.dataset.view === which));
+                fitBtn.hidden = !diagram || !drawn;
+                if (diagram) requestAnimationFrame(readable);
+            }
+            // Fit: the whole diagram in the box (may be small for a big
+            // design). The first view fits the diagram's width but never
+            // goes below a readable zoom: a big design opens at its top at
+            // READABLE_SCALE or more, and the rest is a drag away (or Fit /
+            // Expand). 0.65 of mermaid's 14px labels is still legible.
+            const PAD = 12;
+            const READABLE_SCALE = 0.65;
+            function fitScale() {
+                const vw = view.clientWidth || 1;
+                const vh = view.clientHeight || 1;
+                return Math.max(0.1, Math.min((vw - PAD * 2) / size.w, (vh - PAD * 2) / size.h, 1.6));
+            }
+            function place(scale, { center = true } = {}) {
+                const vw = view.clientWidth || 1;
+                const vh = view.clientHeight || 1;
+                t.scale = scale;
+                const w = size.w * scale;
+                const h = size.h * scale;
+                // Centered across (a top-down flow starts at its top middle).
+                t.x = (vw - w) / 2;
+                t.y = center && h <= vh - PAD * 2 ? (vh - h) / 2 : PAD;
+                apply();
+            }
+            function fit() {
+                if (!drawn || !size.w || !size.h) return;
+                place(fitScale());
+            }
+            function readable() {
+                if (!drawn || !size.w || !size.h) return;
+                const whole = fitScale();
+                if (whole >= READABLE_SCALE) return place(whole);
+                const vw = view.clientWidth || 1;
+                // As wide as the box allows, but never below the readable zoom.
+                place(Math.max(READABLE_SCALE, Math.min(1, (vw - PAD * 2) / size.w)), { center: false });
+            }
+
+            viewButtons.forEach(b => b.addEventListener('click', (e) => { e.stopPropagation(); showView(b.dataset.view); }));
+            fitBtn.addEventListener('click', (e) => { e.stopPropagation(); fit(); });
+            // The large view moves the block to <body> while it's open: an
+            // ancestor of the code column would otherwise trap position: fixed.
+            let placeholder = null;
+            function setExpanded(on) {
+                if (on && !placeholder) {
+                    placeholder = document.createComment('diagram');
+                    el.replaceWith(placeholder);
+                    document.body.appendChild(el);
+                } else if (!on && placeholder) {
+                    placeholder.replaceWith(el);
+                    placeholder = null;
+                }
+                el.classList.toggle('expanded', on);
+                expandBtn.textContent = on ? '✕' : '⤢';
+                expandBtn.title = on ? 'Back to the answer (Esc)' : 'Show larger (Esc to close)';
+                requestAnimationFrame(readable);
+            }
+            expandBtn.addEventListener('click', (e) => { e.stopPropagation(); setExpanded(!el.classList.contains('expanded')); });
+            el.addEventListener('keydown', (e) => { if (e.key === 'Escape' && el.classList.contains('expanded')) setExpanded(false); });
+            document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && el.classList.contains('expanded')) setExpanded(false); });
+            attachCopy(copyBtn, code);
+
+            // Drag to pan (primary button only), Ctrl+wheel to zoom at the
+            // cursor; a plain wheel keeps scrolling the overlay.
+            let drag = null;
+            view.addEventListener('pointerdown', (e) => {
+                if (e.button !== 0 || !drawn) return;
+                drag = { id: e.pointerId, x: e.clientX, y: e.clientY, tx: t.x, ty: t.y };
+                try { view.setPointerCapture(e.pointerId); } catch (_) {}
+                view.classList.add('dragging');
+                e.preventDefault();
+            });
+            view.addEventListener('pointermove', (e) => {
+                if (!drag || e.pointerId !== drag.id) return;
+                t.x = drag.tx + (e.clientX - drag.x);
+                t.y = drag.ty + (e.clientY - drag.y);
+                apply();
+            });
+            const endDrag = (e) => {
+                if (!drag || (e && e.pointerId !== drag.id)) return;
+                drag = null;
+                view.classList.remove('dragging');
+            };
+            view.addEventListener('pointerup', endDrag);
+            view.addEventListener('pointercancel', endDrag);
+            view.addEventListener('wheel', (e) => {
+                if (!e.ctrlKey || !drawn) return;
+                e.preventDefault();
+                e.stopPropagation();
+                const rect = view.getBoundingClientRect();
+                const px = e.clientX - rect.left;
+                const py = e.clientY - rect.top;
+                const next = Math.max(0.1, Math.min(6, t.scale * (e.deltaY < 0 ? 1.12 : 1 / 1.12)));
+                t.x = px - (px - t.x) * (next / t.scale);
+                t.y = py - (py - t.y) * (next / t.scale);
+                t.scale = next;
+                apply();
+            }, { passive: false });
+            view.addEventListener('dblclick', (e) => { e.stopPropagation(); fit(); });
+
+            drawMermaid(code).then((svg) => {
+                stage.innerHTML = svg;
+                const svgEl = stage.querySelector('svg');
+                if (svgEl) {
+                    const vb = svgEl.viewBox && svgEl.viewBox.baseVal;
+                    const w = (vb && vb.width) || parseFloat(svgEl.getAttribute('width')) || 600;
+                    const h = (vb && vb.height) || parseFloat(svgEl.getAttribute('height')) || 400;
+                    svgEl.setAttribute('width', String(w));
+                    svgEl.setAttribute('height', String(h));
+                    svgEl.style.maxWidth = 'none';
+                    size = { w, h };
+                }
+                drawn = true;
+                status.remove();
+                fitBtn.hidden = view.hidden;
+                requestAnimationFrame(readable);
+            }).catch((e) => {
+                console.warn('Diagram not drawn:', e && e.message);
+                status.textContent = '';
+                note.textContent = "The diagram couldn't be drawn — showing its Mermaid code (Copy still works).";
+                note.hidden = false;
+                el.querySelector('[data-view="diagram"]').disabled = true;
+                showView('code');
+            });
+            fitBtn.hidden = true;
+            return el;
         }
 
         function highlightUnder(el) {

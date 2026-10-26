@@ -133,6 +133,7 @@ test('time budget: no new attempt starts after the deadline', async () => {
 test('non-streaming fallback: HTTP error skips the SDK path, network error tries it', async () => {
   fake.script('gemini-3.5-flash-lite', { status: 503, body: errorEvent() });
   fake.script('gemini-3.1-flash-lite', { status: 503, body: errorEvent() });
+  fake.script('gemini-3-flash-preview', { status: 503, body: errorEvent() });
   fake.script('gemini-3.1-flash-lite-preview', { status: 503, body: errorEvent() });
   await assert.rejects(llm._executeWithFallback(REQ, FAR()), /HTTP 503/);
   assert.ok(!fake.models().length || fake.requests.every(r => r.kind !== 'sdk'), 'SDK not tried after an HTTP error');
@@ -140,6 +141,7 @@ test('non-streaming fallback: HTTP error skips the SDK path, network error tries
   fake.reset();
   fake.script('gemini-3.5-flash-lite', { networkError: 'ECONNRESET' }, { text: 'from sdk' });
   fake.script('gemini-3.1-flash-lite', { networkError: 'ECONNRESET' });
+  fake.script('gemini-3-flash-preview', { networkError: 'ECONNRESET' });
   fake.script('gemini-3.1-flash-lite-preview', { networkError: 'ECONNRESET' });
   assert.equal(await llm._executeWithFallback(REQ, FAR()), 'from sdk');
   assert.ok(fake.requests.some(r => r.kind === 'sdk'));
@@ -187,6 +189,29 @@ test('overloaded (503) → skipped for a while, then tried again after the coold
   }
 });
 
+test('out of daily quota → back in first place after midnight Pacific, even across a restart', async () => {
+  let t = Date.UTC(2026, 8, 28, 1, 0, 0); // 10:00 Japan time; reset is 07:00 UTC
+  modelHealth._setNow(() => t);
+  try {
+    fake.script('A', DAILY_429);
+    fake.script('B', fake.sse('b1'), fake.sse('b2'));
+    await llm.executeStreamingRequest(REQ, null, FAR(), { models: ['A', 'B'] });
+    t = Date.UTC(2026, 8, 28, 6, 59, 0); // one minute before the reset: still skipped
+    await llm.executeStreamingRequest(REQ, null, FAR(), { models: ['A', 'B'] });
+    assert.deepEqual(fake.models(), ['A', 'B', 'B']);
+    modelHealth._reload(); // app restarted before the reset: still remembered
+    assert.equal(modelHealth.status('A').reason, 'daily-quota');
+    t = Date.UTC(2026, 8, 28, 7, 0, 1); // just after midnight Pacific
+    modelHealth._reload(); // and restarted again after it
+    fake.reset();
+    fake.script('A', fake.sse('a is back'));
+    assert.equal(await llm.executeStreamingRequest(REQ, null, FAR(), { models: ['A', 'B'] }), 'a is back');
+    assert.deepEqual(fake.models(), ['A'], 'A asked first again, B not needed');
+  } finally {
+    modelHealth._setNow(null);
+  }
+});
+
 test('a model that went silent is skipped next time, saving the wait', async () => {
   fake.script('A', { stall: true });
   fake.script('B', fake.sse('b1'), fake.sse('b2'));
@@ -217,4 +242,137 @@ test('non-streaming paths skip and record too', async () => {
   assert.equal(await llm.executeAlternativeRequest(REQ, FAR(), { models: ['A', 'B'] }), 'alt ok');
   assert.equal(await llm.executeAlternativeRequest(REQ, FAR(), { models: ['A', 'B'] }), 'alt ok 2');
   assert.deepEqual(fake.models('generate'), ['A', 'B', 'B']);
+});
+
+// ── Hedged start: a slow first model no longer costs the full first-chunk wait ──
+const HEDGE = { models: ['A', 'B', 'C'], hedgeAfterMs: 100, firstChunkTimeoutMs: 2000, backupFirstChunkTimeoutMs: 2000 };
+
+test('hedge: a fast first model answers alone — the backup is never started', async () => {
+  fake.script('A', fake.sse('from A'));
+  assert.equal(await llm.executeStreamingRequest(REQ, null, FAR(), HEDGE), 'from A');
+  await new Promise(r => setTimeout(r, 150)); // past the hedge delay
+  assert.deepEqual(fake.models(), ['A']);
+  assert.equal(llm.lastModel, 'A');
+});
+
+test('hedge: slow first model → backup starts after the hedge delay, wins, only its text is shown', async () => {
+  fake.script('A', { ...fake.sse('late A'), firstDelayMs: 600 });
+  fake.script('B', fake.sse('fast ', 'B'));
+  let shown = '';
+  const t0 = Date.now();
+  const out = await llm.executeStreamingRequest(REQ, d => { shown += d; }, FAR(), HEDGE);
+  const ms = Date.now() - t0;
+  assert.equal(out, 'fast B');
+  assert.equal(shown, 'fast B', 'nothing from the slow model reached the screen');
+  assert.ok(ms >= 100 && ms < 500, `answered after the hedge delay, not A's 600ms (${ms}ms)`);
+  assert.deepEqual(fake.models(), ['A', 'B']);
+  assert.equal(modelHealth.status('A').reason, 'silent', 'the loser is skipped next time');
+  assert.equal(llm.lastModel, 'B');
+});
+
+test('hedge: first model fails fast (503) → backup starts right away, no hedge wait', async () => {
+  fake.script('A', { status: 503, body: errorEvent(503) });
+  fake.script('B', fake.sse('B'));
+  const t0 = Date.now();
+  assert.equal(await llm.executeStreamingRequest(REQ, null, FAR(), { ...HEDGE, hedgeAfterMs: 1000 }), 'B');
+  assert.ok(Date.now() - t0 < 500);
+  assert.equal(modelHealth.status('A').reason, 'overloaded');
+});
+
+test('hedge: both racing models fail → the rest of the chain is tried', async () => {
+  fake.script('A', { status: 503, body: errorEvent(503) });
+  fake.script('B', { status: 503, body: errorEvent(503) });
+  fake.script('C', fake.sse('C saves it'));
+  assert.equal(await llm.executeStreamingRequest(REQ, null, FAR(), HEDGE), 'C saves it');
+  assert.deepEqual(fake.models(), ['A', 'B', 'C']);
+});
+
+test('hedge: the winner breaks off mid-answer → shown text reset, next untried model answers', async () => {
+  fake.script('A', { sse: [t('half'), errorEvent(503)] });
+  fake.script('B', fake.sse('B complete'));
+  let shown = '';
+  let resets = 0;
+  const out = await llm.executeStreamingRequest(REQ, d => { shown += d; }, FAR(), { ...HEDGE, onReset: () => { resets++; shown = ''; } });
+  assert.equal(out, 'B complete');
+  assert.equal(shown, 'B complete');
+  assert.equal(resets, 1);
+});
+
+test('hedge: slow backup winner breaking off does not retry the aborted primary', async () => {
+  fake.script('A', { ...fake.sse('late A'), firstDelayMs: 600 });
+  fake.script('B', { sse: [t('half'), errorEvent(503)] });
+  fake.script('C', fake.sse('C'));
+  assert.equal(await llm.executeStreamingRequest(REQ, null, FAR(), HEDGE), 'C');
+  assert.deepEqual(fake.models(), ['A', 'B', 'C']);
+});
+
+test('no hedging for an explicit model list unless asked (reasoning chain thinks before answering)', async () => {
+  fake.script('A', { ...fake.sse('thinker'), firstDelayMs: 200 });
+  assert.equal(await llm.executeStreamingRequest(REQ, null, FAR(), { models: ['A', 'B'], firstChunkTimeoutMs: 2000 }), 'thinker');
+  assert.deepEqual(fake.models(), ['A']);
+});
+
+test('normal chain hedges by default (llm.gemini.hedgeAfterMs)', async () => {
+  const prev = config.get('llm.gemini.hedgeAfterMs');
+  config.set('llm.gemini.hedgeAfterMs', 100);
+  try {
+    fake.script('gemini-3.5-flash-lite', { ...fake.sse('late'), firstDelayMs: 600 });
+    fake.script('gemini-3.1-flash-lite', fake.sse('backup'));
+    assert.equal(await llm.executeStreamingRequest(REQ, null, FAR()), 'backup');
+  } finally {
+    config.set('llm.gemini.hedgeAfterMs', prev);
+  }
+});
+
+test('normal chain outage (2026-09-29): primary out for the day + 3.1-flash-lite silent → 3-flash-preview leads, the preview is hedged in', async () => {
+  const prev = config.get('llm.gemini.hedgeAfterMs');
+  config.set('llm.gemini.hedgeAfterMs', 100);
+  try {
+    modelHealth.recordFailure('gemini-3.5-flash-lite', new Error('HTTP 429 RESOURCE_EXHAUSTED quotaId GenerateRequestsPerDayPerProjectPerModel-FreeTier'));
+    modelHealth.recordFailure('gemini-3.1-flash-lite', Object.assign(new Error('No response within 8s (first-chunk timeout)'), { firstChunkTimeout: true }));
+    fake.script('gemini-3-flash-preview', fake.sse('from 3-flash-preview'));
+    assert.equal(await llm.executeStreamingRequest(REQ, null, FAR()), 'from 3-flash-preview');
+    assert.deepEqual(fake.models(), ['gemini-3-flash-preview'], 'skipped models not asked; 3-flash-preview first');
+
+    fake.reset();
+    fake.script('gemini-3-flash-preview', { ...fake.sse('late'), firstDelayMs: 600 });
+    fake.script('gemini-3.1-flash-lite-preview', fake.sse('preview saves it'));
+    assert.equal(await llm.executeStreamingRequest(REQ, null, FAR()), 'preview saves it');
+    assert.deepEqual(fake.models(), ['gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview']);
+  } finally {
+    config.set('llm.gemini.hedgeAfterMs', prev);
+  }
+});
+
+// ── Probe ──
+test('probe: tiny request, minimal thinking, success clears the skip', async () => {
+  modelHealth.recordFailure('gemini-3.5-flash-lite', new Error('HTTP 503 UNAVAILABLE'));
+  fake.script('gemini-3.5-flash-lite', fake.sse('Hi!'));
+  const r = await llm.probeModel('gemini-3.5-flash-lite');
+  assert.equal(r.ok, true);
+  assert.equal(modelHealth.status('gemini-3.5-flash-lite'), null);
+  const body = fake.requests[0].body;
+  assert.equal(body.generationConfig.maxOutputTokens, 16);
+  assert.deepEqual(body.generationConfig.thinkingConfig, { thinkingLevel: 'minimal' });
+  assert.equal(body.systemInstruction, undefined, 'no prompt/resume sent');
+});
+
+test('probe: slow first chunk counts as a failure and is recorded', async () => {
+  config.set('llm.gemini.probe', { firstChunkTimeoutMs: 50, timeoutMs: 2000 });
+  try {
+    fake.script('gemini-3.1-flash-lite', { stall: true });
+    const r = await llm.probeModel('gemini-3.1-flash-lite');
+    assert.equal(r.ok, false);
+    assert.equal(r.recorded, true);
+    assert.equal(modelHealth.status('gemini-3.1-flash-lite').reason, 'silent');
+  } finally {
+    config.set('llm.gemini.probe', { firstChunkTimeoutMs: 5000, timeoutMs: 10000, intervalMs: 10000, networkRetryMs: 60000 });
+  }
+});
+
+test('probe: network error is not the model\'s fault (not recorded)', async () => {
+  fake.script('gemini-3.1-flash-lite', { networkError: 'ENOTFOUND' });
+  const r = await llm.probeModel('gemini-3.1-flash-lite');
+  assert.deepEqual([r.ok, r.recorded], [false, false]);
+  assert.equal(modelHealth.status('gemini-3.1-flash-lite'), null);
 });

@@ -4,8 +4,76 @@ const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
 const responseLanguage = require('../core/response-language');
 const { matchKnowledge } = require('../core/knowledge');
-const { getComparisonNote } = require('../core/answer-format');
+const { getComparisonNote, CHAT_CLARIFY_NOTE, SPOKEN_NOTE, HEARD_PREFIX, splitImplementOffer, createImplementFilter, CLARIFY_PREFIX, clarifyState, clarifyQuestion, heardCodingQuestion } = require('../core/answer-format');
+
+/**
+ * 'yes' when text starts with the marker (after whitespace, optionally
+ * bold), 'maybe' while it could still become it, 'no' otherwise.
+ */
+function markerState(text, marker) {
+  const head = String(text || '').trimStart().toUpperCase();
+  for (const prefix of [marker, `**${marker}`]) {
+    if (head.startsWith(prefix)) return 'yes';
+    if (prefix.startsWith(head)) return 'maybe';
+  }
+  return 'no';
+}
+
+/**
+ * Split an interviewer answer into its optional first "HEARD: a → b" line
+ * (returned as note "a → b") and the answer itself.
+ */
+function splitHeardNote(text) {
+  const s = String(text || '');
+  if (markerState(s, HEARD_PREFIX) !== 'yes') return { note: null, body: s };
+  const trimmed = s.trimStart();
+  const nl = trimmed.indexOf('\n');
+  const line = nl === -1 ? trimmed : trimmed.slice(0, nl);
+  const note = line.replace(/^(\*\*)?HEARD:(\*\*)?\s*/i, '').replace(/\*\*$/, '').trim();
+  return { note: note || null, body: nl === -1 ? '' : trimmed.slice(nl + 1).replace(/^\s*\n/, '') };
+}
+
+// System design mode, requirement-gathering stage: the hidden REQ: block at
+// the end of an answer is cut from what's shown and returned as
+// metadata.reqLines (src/core/system-design.js). A no-op in every other case,
+// so normal answers are untouched. Read once per request, at its start.
+function reqStripper() {
+  if (systemDesign.getStage() !== 'clarify') {
+    return { active: false, wrap: (emit) => emit, reset() {}, flush() {}, split: (text) => ({ body: text, reqLines: null }) };
+  }
+  let filter = null;
+  return {
+    active: true,
+    wrap(emit) {
+      filter = createReqFilter((d) => { if (d) emit(d); });
+      return (d) => { if (d) filter.push(d); };
+    },
+    reset() { if (filter) filter.reset(); },
+    flush() { if (filter) filter.flush(); },
+    split(text) {
+      const { body, lines } = splitReqBlock(text);
+      return { body, reqLines: lines };
+    }
+  };
+}
+
+// Same for a finished non-streamed result.
+function withReqLines(result, stripper) {
+  if (!stripper.active || !result || typeof result.response !== 'string') return result;
+  const { body, reqLines } = stripper.split(result.response);
+  return { ...result, response: body, metadata: { ...(result.metadata || {}), reqLines } };
+}
+
+// Strips the IMPLEMENT line from a finished result into metadata.implementOffer.
+function withImplementOffer(result) {
+  if (!result || typeof result.response !== 'string') return result;
+  const { offer, body } = splitImplementOffer(result.response);
+  if (!offer && body === result.response) return result;
+  return { ...result, response: body, metadata: { ...(result.metadata || {}), implementOffer: offer } };
+}
 const codeFormats = require('../core/code-formats');
+const systemDesign = require('../core/system-design');
+const { createReqFilter, splitReqBlock } = systemDesign;
 const modelHealth = require('../core/model-health');
 
 // Appended (last) to the active profile prompt (prompts/<profile>.md) for
@@ -16,12 +84,27 @@ const VOICE_TRANSCRIPT_NOTE = `
 
 ## Live Transcript Input (overrides the sections above for this message)
 The user turn is a live speech-to-text transcript of what the interviewer just said. It may be fragmentary, run two sentences together, or contain misheard words — infer the intended question from the wording and the conversation so far, and answer that.
-- MISHEARD TECHNICAL TERMS: speech recognition often turns a technical term into a sound-alike word, number or name. Before answering, read any word that doesn't fit a technical interview as the technical term that sounds like it, preferring the selected framework, the profile's stack and the topic of the conversation. Examples: "V4" / "V for" → \`v-for\`, "V if" → \`v-if\`, "V model" → \`v-model\`, "V bind" → \`v-bind\`, "View JS" / "ViewJS" → Vue.js, "composition a p i" → Composition API, "ZulStrand" / "Zoo stand" → Zustand, "Redex" → Redux, "VFF" → BFF, "use effect" → \`useEffect\`, "collagens" → Coroutines. "in a loop" / "Inalou" next to \`v-for\` means "in a loop" / "in the loop" of a Vue template. Answer the corrected question directly; do not mention the mishearing or ask what they meant unless no reading makes technical sense.
-- DEFAULT FOR SPOKEN QUESTIONS: a verbal, skimmable answer with NO code blocks. This applies to "what is X", "how does X work", "why X", "how would you handle/approach/design X", "how did you do/handle/solve X", "tell me about X" and experience/project questions — explain in words; if a class, function, or library name helps, put it inline as a short code-highlighted span, never a fenced code block.
-- Only include a code block when the interviewer explicitly asks you to write, code, implement, or show code, reads out a concrete coding/algorithm problem to solve (e.g. "write a function that reverses a linked list"), asks you to fix/modify specific code, or asks to change or redo code from an earlier answer (e.g. "now do it in Vue"). Then use the coding format above.
+- MISHEARD TECHNICAL TERMS: speech recognition garbles spoken code and technical terms in predictable ways — it merges or splits identifiers, swaps letters and syllables for sound-alike words, numbers or names, and drops or spells out dots and brackets. Before answering, check every word or phrase that doesn't name a real thing in a technical interview, or makes no sense as code, and rebuild the most likely real term: first by how it sounds, then by what actually exists in the selected framework and language, the profile's stack and the conversation so far (an API or name from the previous answer is the most likely match). Examples of the pattern, not a complete list: "V4" / "V for" → \`v-for\`, "V if" → \`v-if\`, "V model" → \`v-model\`, "V bind" → \`v-bind\`, "View JS" / "ViewJS" → Vue.js, "composition a p i" → Composition API, "ZulStrand" / "Zoo stand" → Zustand, "Redex" → Redux, "VFF" → BFF, "use effect" → \`useEffect\`, "collagens" → Coroutines, "set time out" → \`setTimeout\`. "cloud" / "claw" / "clawed" / "cloud code" → Claude / Claude Code (Anthropic's AI) when the question is about AI tools, agents, automation or code review; a question about cloud hosting or infrastructure stays "cloud". "speaker" / "speaker app" / "speakr" → Speeqr (my calling app) when the question is about my projects, an app's architecture or the conversation is already about Speeqr; an audio speaker stays a speaker. "in a loop" / "Inalou" next to \`v-for\` means "in a loop" / "in the loop" of a Vue template. A term that makes sense as spoken stays as it is (a "2D array" or a 2D canvas is real). In a question about the code from the previous answer ("why didn't you use safe count?"), words that sound like a name for something in that code are a proposed name (\`safeCount\` for the guarded count), not a mishearing. Answer the rebuilt question directly — exactly what it asks, nothing more; do not mention the mishearing in the answer. The one exception is a request to write or change code whose unclear term you can't rebuild with confidence: see "Unclear word in a coding request" below.
+- NOTE FOR THE CANDIDATE: only when you answered a different real term than the words in the transcript (a rebuilt misheard term — not a spacing or capitalization fix like "use effect" → \`useEffect\`), make the very first line \`${HEARD_PREFIX} <words as transcribed> → <term you answered>\`, then the answer exactly as usual. When the transcribed sound also fits other real terms, end that line with \` | <term>, <term>\` (at most 2): real API or library names that sound like the transcribed words syllable by syllable, the selected framework's own API first, each different from the term you answered, e.g. \`${HEARD_PREFIX} view ex → Vue.js | Vuex\`. Leave it off when only one reading fits. That line is shown to the candidate only, never part of the answer. No such line when nothing was rebuilt.
+- DEFAULT FOR SPOKEN QUESTIONS: a verbal, skimmable answer that's easy to read out, with NO code blocks. This applies to "what is X", "how does X work", "why X", "how would you handle/approach/design X", "how did you do/handle/solve X", "tell me about X" and experience/project questions — explain in words; if a class, function, or library name helps, put it inline as a short code-highlighted span, never a fenced code block.
+- Only include a code block when the interviewer explicitly asks you to write, code, implement, or show code, reads out a concrete coding/algorithm problem to solve (e.g. "write a function that reverses a linked list"), asks you to fix/modify specific code, or asks to change or redo code from an earlier answer (e.g. "now do it in Vue"). Then use the coding format above. A question about code from an earlier answer ("why didn't you use X?", "could we use X?") is not a request to change it: answer it as "When code is needed" above says for that case (words, at most the few lines that would change, and the IMPLEMENT line when there's a change worth making).
 - For an explicit system-design question ("design X"), a short text flow diagram is fine — that is not code.
 - Pure social small talk with no technical content (e.g. a bare "hello", "how are you", "can you hear me") gets a brief, natural one-line reply, then stop.
-- Anything with technical content or an actual question in it gets a real answer — never dismiss it as "not relevant."`;
+- Anything with technical content or an actual question in it gets a real answer — never dismiss it as "not relevant."
+
+## Unclear word in a coding request (interviewer)
+Only when the interviewer asks to write or change code, including a follow-up like "add …" to the code above. Building the wrong change costs the candidate far more than one question. Before writing anything, compare each unclear word with the term you would build. Every heard word must be explained by that term: a change that leaves heard words unexplained, or adds a feature none of them name (for example the next step you'd expect rather than what was said), doesn't match.
+- Its sounds match exactly one real term syllable by syllable, and that term fits the code so far: build it as usual (with the HEARD line).
+- Otherwise build nothing. That covers sounds that fit two or more real terms that would produce different code (spoken dots and words can be a chain of separate calls or one method name), a term the sounds don't really match, and a fit that would mean inventing a mode, option, matcher or API (a word that merely starts like a real one is not a fit). The whole reply is one line, ${CLARIFY_PREFIX} Did you mean \`<term>\`, \`<term>\` or \`<term>\`? with 1 to 3 real terms that sound like it and fit the framework and the code so far, most likely first, no explanation. If no real term fits at all, the line is ${CLARIFY_PREFIX} What did you mean by "<the words>"? The candidate picks one and then you build it.
+A clear request for a real feature is never questioned. Concept, experience and design questions are never questioned: answer them.`;
+
+// True for an answer whose only fenced blocks are ```text flows (an
+// architecture / "my work" answer), never for one with code.
+function hasTextFlowOnly(answer) {
+  const fences = String(answer || '').match(/^\s*```[^\n]*/gm) || [];
+  const openings = fences.filter((_, i) => i % 2 === 0).map(f => f.trim().slice(3).trim().toLowerCase());
+  return openings.length > 0 && openings.every(lang => lang === 'text');
+}
 
 // Appended to the active profile prompt ONLY for a user-triggered "More
 // details" request (see processExpansionStream). The normal answer path never
@@ -39,8 +122,9 @@ The conversation contains the original interview question and the concise answer
   - Android/Kotlin: relevant internals, lifecycle/concurrency implications, practical production considerations, important edge cases.
   - Coding/DSA (the answer has code): keep the same sections, each more in depth and readable. Implementation: explain every numbered \`(n)\` comment in the code — what that line does and why, and the language/framework concepts involved (closures, higher-order functions, rest/spread, destructuring, async/await, Vue reactivity, computed/watchers, React hooks…) — only those that are relevant, non-obvious or useful for an interview follow-up, not every feature for its own sake. Example flow: trace what actually happens when the code runs, step by step (calls, what a closure captures, state/reactivity updates, re-renders), with the matching \`(n)\`. Also deeper edge cases, complexity details and trade-offs. Don't reprint the code — refer to its lines by \`(n)\`, using only the numbers that actually appear in that code; a line without a number (or code with no numbered comments) is referred to by quoting it as inline code.
   - System design: ALWAYS include a design diagram in easily readable text form (boxes and arrows, e.g. [Client] --> [API] --> [DB]) — if the original answer already had one, give a more detailed version rather than omitting it. Then deeper design reasoning, important trade-offs, scaling considerations, reliability/failure cases, and the relevant data flow.
-  - Behavioral/personal: expand ONLY with information actually present in the Candidate Background / Personal & Interview Notes above. Never invent companies, projects, responsibilities, achievements, opinions, or experiences — if nothing more is available, add depth on reasoning/approach instead of new facts.
-  - My own project / architecture (e.g. "tell me more about your work at GORA", "walk me through GORA"): the deep, readable walkthrough of the same topic. Build on the original answer without reprinting it. Open with one or two lines of context (the product, and what the walkthrough covers), then follow the flow layer by layer the way a request travels (e.g. user → frontend → API layer → BFF → services → data → back to the UI); on the Frontend profile the frontend layers get the most depth. Give each layer a \`###\` heading, and \`####\` sub-headings for its main parts when it has several (e.g. rendering, state, forms). Under them, write 2-4 bullets of simple, complete first-person sentences that are easy to read out loud: what the layer does, which libraries we used there, how data moves on to the next layer, and where my own work fits. Add a **The Why:** line only where a decision is worth explaining — why we chose or added it (e.g. Sentry: what it catches and why we added it) — not on every layer. For a "my work" question, keep the walkthrough anchored on the features I built and show where each one sits in the flow. Add a \`\`\`text flow when it helps follow the data. No label-only fragments such as "Technologies: X, Y" or one-line bullets per field. Use the reference notes and never contradict them (e.g. don't relabel the stack with technologies the notes don't name) or blur separate systems (e.g. the GORA customer platform vs the B2B portal). Substantially deeper than the original answer, still skimmable.
+  - Behavioral/personal (a career walkthrough: see below): expand ONLY with information actually present in the Candidate Background / Personal & Interview Notes above. Never invent companies, projects, responsibilities, achievements, opinions, or experiences — if nothing more is available, add depth on reasoning/approach instead of new facts.
+  - Career walkthrough ("tell me about yourself / your experience / walk me through your resume"): substantially longer than the original answer and covering every project in it, in the same order, down to the last one. Use exactly the original \`### Company — role, dates\` and \`#### Project\` headings. Under each project: one anchor line (no restated bullets), a compact \`\`\`text flow from the reference notes, then 2-4 bullets on the main layers the way a request travels (this profile's side gets the most depth: e.g. rendering, state, API layer), each naming its libraries and where my features sit, and one **The Why:** line for the key decision. Rakuten GORA (each app) and Speeqr get the most depth; the other projects get a short flow and 2 bullets. Facts only from the reference notes, the Candidate Background and the original answer.
+  - My own project / architecture (e.g. "tell me more about your work at GORA", "walk me through GORA"): the deep, readable walkthrough of the same topic. Build on the original answer without reprinting it: it already introduced the product, the architecture, the stack and my work, so don't introduce them again — open with one line saying what this goes deeper on, then follow the flow layer by layer the way a request travels (e.g. user → frontend → API layer → BFF → services → data → back to the UI); on the Frontend profile the frontend layers get the most depth. Give each layer a \`###\` heading, and \`####\` sub-headings for its main parts when it has several (e.g. rendering, state, forms). Under them, write 2-4 bullets of simple, complete first-person sentences that are easy to read out loud: what the layer does, which libraries we used there, how data moves on to the next layer, and where my own work fits. Add a **The Why:** line only where a decision is worth explaining — why we chose or added it (e.g. Sentry: what it catches and why we added it) — not on every layer. For a "my work" question, keep the walkthrough anchored on the features I built and show where each one sits in the flow. Add a \`\`\`text flow when it helps follow the data. No label-only fragments such as "Technologies: X, Y" or one-line bullets per field. Use the reference notes and never contradict them (e.g. don't relabel the stack with technologies the notes don't name) or blur separate systems (e.g. the GORA customer platform vs the B2B portal). Cover what the first answer only named: the architecture layer by layer and how my module fits, the technology choices with their Why, the data flow, and the implementation details of my features (state, validation, API calls, error handling, lifecycle). Facts only from the reference notes, the Candidate Background and the original answer — no new technologies, features or numbers; where the notes are silent, describe following the existing patterns. Substantially deeper than the original answer, still skimmable.
 - When the original answer has no code, include code only when it materially helps (e.g. the question explicitly asked for code); otherwise explain in words.
 - The original question may be a live speech-to-text transcript (possibly misheard) — interpret it the same way the original answer did.`;
 
@@ -51,14 +135,13 @@ The conversation contains the original interview question and the concise answer
 const OPTIMIZE_NOTE = `
 
 ## Optimized Solution Request (overrides "Give ONE solution" for this message)
-The conversation contains the original question and the first solution already given. Give the optimized version of that solution — think it through more deeply than the first answer.
-- What "optimized" means depends on the problem:
-  - DSA/algorithm problem: better time/space complexity (name the technique and why it's faster), or say why the current one is already optimal.
-  - Frontend, backend or mobile implementation (Vue, React, Spring, Node, Android…): not Big-O — the best industry-standard way to build it, using the established patterns and APIs of the framework and version in use instead of custom mechanisms: correctness and realistic edge cases, race conditions and cleanup, error handling, maintainability, concise idiomatic code (lambdas, built-ins).
-  - Add caching, better state management or abstractions only when they meaningfully improve this problem; stay proportionate to the interview question.
-- Build on the first solution inside the same given code/signature (see "Working inside given code"); don't switch to a different architecture.
-- Use the same Coding answer format with the heading \`### Optimized — <short name>\`: Understanding = one line on what's being improved; Approach = each improvement, the concrete problem it prevents, and how; numbered \`(n)\` code comments matching the Implementation points, with new or changed lines marked, e.g. \`// (2) NEW: <what changed>\`; Complexity compares with the first solution; Example flow shows the same input before → after the improvement.
-- If the first solution is already optimal and follows best practice, say so in one line and list only refinements that genuinely matter — no micro-optimizations or engine-specific tweaks.`;
+The conversation contains the original question and the first solution already given. Give the optimized version of that solution.
+- First check whether it can be meaningfully improved. If it is already optimal and idiomatic, say so in the Understanding line, keep its code, and give at most 1-2 refinements that genuinely matter under Possible improvements — no micro-optimizations or engine-specific tweaks.
+- Otherwise make at most 3 changes — the ones with the biggest real effect on this code, each fixing a concrete problem it has; anything else worth doing goes in one line under Possible improvements:
+  - DSA/algorithm problem: better time/space complexity (name the technique and why it's faster).
+  - Frontend, backend or mobile implementation (Vue, React, Spring, Node, Android…): not Big-O — a real bug or missed edge case, or a clearer, more idiomatic use of the established APIs of the framework and version in use instead of a custom mechanism.
+- Keep it about the same size: build on the first solution inside the same given code/signature and structure (see "Working inside given code"); no new functions, hooks, classes or layers unless a fix needs one. The first answer's Possible improvements are not a to-do list — add one only if it fixes a real problem in this code.
+- Use the same Coding answer format with the heading \`### Optimized — <short name>\`: Understanding = one line on what's being improved; Approach (required) = \`**Key idea:**\` one sentence on the main improvement, then numbered steps that walk through the whole optimized solution, with each improvement step marked **(new)** and saying the concrete problem it prevents and how; numbered \`(n)\` comments on each logical step of the code (same density as the Coding answer format) matching the Implementation points, with new or changed lines marked \`NEW:\` (in this mode, not \`CHANGED:\`) saying in a few words what changed and why it's better, e.g. \`// (2) NEW: cancel the previous request so a slow old response can't overwrite newer results\`; the Implementation point of a NEW line says what was wrong or missing in the first solution and how this line fixes it; Complexity compares with the first solution; Example flow shows the same input before → after the improvement when the behavior changed, otherwise a normal Example flow.`;
 
 // Appended to the active profile prompt ONLY for a user-triggered "Deep
 // reasoning" request (processExpansionStream with mode 'deep'). Unlike
@@ -71,7 +154,7 @@ const DEEP_REASONING_NOTE = `
 The conversation contains the original interview question and the answer already given. Think the question through again from scratch, then review that answer against it: keep everything that is correct, fix anything weak, inaccurate, contradictory or badly structured, and add the important points an experienced engineer would expect and the answer is missing. The result is a better, more complete and better-reasoned answer to the SAME question — not a longer copy of the original and not a list of extra details.
 - Start directly with the content, in first person — no preamble such as "Here is a deeper look…", and don't mention reviewing or the original answer.
 - Readable and skimmable during a live interview: a one- or two-line summary first, then short \`###\` headings with bullets, numbered steps, compact tables and \`\`\`text diagrams where they help. No long paragraphs, no repetition.
-- Use the Candidate Background, Personal / Interview Notes, reference notes, selected framework/language and the conversation only where relevant to this question. Never invent experience, projects, companies, metrics or responsibilities to make the answer sound stronger; don't dump unrelated project details.
+- Build on the Candidate Background, Personal / Interview Notes, reference notes, selected framework/language and the conversation. This mode exists to reason BEYOND them: anticipate and fill in what isn't written down — how something most likely worked in practice, implementation details, edge cases, failure modes, trade-offs, alternatives considered, what I'd do differently, and what an interviewer will probe next — and say it naturally in first person as part of my experience, as long as it fits the described architecture and stack and never contradicts the notes. Keep the fixed facts fixed: don't change companies, projects, dates, roles or numbers the notes give, and don't make up new precise metrics (percentages, user counts, time saved) — describe impact qualitatively instead. Don't dump unrelated project details.
 
 ### Theory, "how does it work", architecture and my own project work
 Use only the sections that fit the question, in this order:
@@ -81,12 +164,18 @@ Use only the sections that fit the question, in this order:
 - **Design decisions** — each with a **The Why:** line (the problem it solves and what the alternative would have cost).
 - **Trade-offs and failure cases** — plus scalability, performance, security, testing and operations only where they actually matter for this question.
 - **Pitfalls** and a short **real-world example** or my relevant experience.
-For my own project work, keep three things clearly apart with these labels: **What the project used** (facts from the notes), **What I built** (only work the notes attribute to me), **Inference** (reasonable architectural reasoning not stated in the notes — say so).
+For my own project work, blend the facts from the notes and the reasoned details into one natural first-person answer — no "inference" or "not in the notes" labels.
+
+### Behavioral stories (proudest project, biggest challenge, a hard problem…)
+Keep the same story or stories and every project the answer already covered (e.g. a closing Speeqr section stays), in the same order (the problem, my part, what I did, the result). Go deeper on each: why the problem happened in the first place, how each fix worked step by step, the trade-offs and alternatives we weighed, what I learned or would do differently, then a short **Likely follow-ups** list: 2-4 questions the interviewer may ask next, each with a one- or two-line answer.
+
+### Career walkthrough ("tell me about yourself / your experience")
+Keep the original \`### Company\` / \`#### Project\` headings in the same order. Under each project, go deeper on its architecture from the reference notes: a \`\`\`text flow, the layers, the key decisions and their trade-offs, and where my features sit. Rakuten GORA (each app) and Speeqr get the most depth.
 
 ### Coding answers (the answer contains code)
 Review, don't redesign — a different algorithm or complexity class is what the separate "Optimized solution" button is for. ALWAYS use exactly this structure: the first line of the response is the \`### Solution — … (reviewed)\` heading below, then optionally one \`### Improved — …\` section — no other top-level headings, and no section about what was wrong with a "previous"/"original" answer (weaknesses go in Edge cases).
 - Keep the exact format, framework, API style (e.g. Options API vs Composition API, CDN page vs SFC), language, names and signature of the given solution and of any code shown in the question. Don't rewrite surrounding code.
-- \`### Solution — <same short name> (reviewed)\` — Understanding (1-2 lines), then **Approach** as a concise thought process (numbered steps), then the SAME code copied verbatim with its same numbered \`(n)\` comments (don't edit, renumber or add lines — fixes belong in Improved), then **Implementation**: every \`(n)\` explained, including the language/framework features involved (closures, reactivity, hooks, async/await…) where they're non-obvious or likely follow-ups. Then **Complexity** derived step by step — each step names the line(s) responsible, quoted as inline code, and the totals follow from them (time, then space). Then **Edge cases** it handles or misses.
+- \`### Solution — <same short name> (reviewed)\` — Understanding (1-2 lines), then **Approach** (required): a \`**Key idea:**\` sentence, then a concise thought process (numbered steps), then the SAME code copied verbatim with its same numbered \`(n)\` comments (don't edit, renumber or add lines — fixes belong in Improved), then **Implementation**: every \`(n)\` explained, including the language/framework features involved (closures, reactivity, hooks, async/await…) where they're non-obvious or likely follow-ups. Then **Complexity** derived step by step — each step names the line(s) responsible, quoted as inline code, and the totals follow from them (time, then space). Then **Edge cases** it handles or misses.
 - If there is a meaningful correctness, robustness or readability improvement to the SAME approach (a bug, a missed edge case, a race/cleanup issue, clearer idiomatic code), add \`### Improved — <short name>\`: what changes and why (bullets), then the complete improved code with changed lines marked \`// (n) CHANGED: …\` (comment syntax valid at that spot), then any Complexity difference. Otherwise end with a short **Possible improvements** bullet list instead — no second code block.`;
 
 // Expansion modes that run on the reasoning models (llm.gemini.reasoning).
@@ -110,6 +199,8 @@ class LLMService {
     this.isInitialized = false;
     this.requestCount = 0;
     this.errorCount = 0;
+    // The model that produced the most recent answer (status display).
+    this.lastModel = null;
     
     this.initializeClient();
   }
@@ -332,7 +423,7 @@ class LLMService {
       throw new Error(`No prompt found for profile: ${activeSkill}`);
     }
 
-    const parts = [{ text: this.formatImageInstruction(activeSkill, programmingLanguage, { count: images.length, text }) }];
+    const parts = [{ text: this.formatImageInstruction(activeSkill, programmingLanguage, { count: images.length, text }) + systemDesign.getSystemDesignTurnNote() }];
     images.forEach((img, i) => {
       if (images.length > 1) parts.push({ text: `Image ${i + 1} of ${images.length}:` });
       parts.push({ inlineData: { data: img.buffer.toString('base64'), mimeType: img.mimeType || 'image/png' } });
@@ -434,17 +525,28 @@ class LLMService {
     const startTime = Date.now();
     const deadline = this._newDeadline();
     this.requestCount++;
+    const req = reqStripper();
 
     try {
-      const fullText = await this.executeStreamingRequest(request, (delta) => {
+      const push = req.wrap((delta) => {
         if (typeof onDelta === 'function' && delta) {
           onDelta(delta);
         }
-      }, deadline, { onReset });
+      });
+      const rawText = await this.executeStreamingRequest(request, push, deadline, {
+        onReset: () => {
+          req.reset();
+          if (typeof onReset === 'function') onReset();
+        }
+      });
+      req.flush();
+      const { body: fullText, reqLines } = req.split(rawText);
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
         : fullText;
+
+      this._warnIfApproachMissing(finalResponse, { source: 'image' });
 
       logger.logPerformance('LLM image streaming', startTime, {
         activeSkill,
@@ -463,7 +565,8 @@ class LLMService {
           requestId: this.requestCount,
           usedFallback: false,
           streamed: true,
-          ...this._imageMetadata(images)
+          ...this._imageMetadata(images),
+          ...(req.active ? { reqLines } : {})
         }
       };
     } catch (error) {
@@ -471,7 +574,7 @@ class LLMService {
         error: error.message,
         requestId: this.requestCount
       });
-      return this.processImageWithSkill(images, activeSkill, programmingLanguage, { text, deadline, request });
+      return withReqLines(await this.processImageWithSkill(images, activeSkill, programmingLanguage, { text, deadline, request }), req);
     }
   }
 
@@ -482,10 +585,10 @@ class LLMService {
       : `This screenshot was taken during a ${activeSkill.toUpperCase()} interview.`;
     const typed = String(text || '').trim();
     const typedNote = typed ? ` The candidate also typed this about it — treat it as more context for the same question: "${typed}".` : '';
-    return `${intro}${typedNote} First identify what is being asked, what code/environment is already shown or handled by the platform, which part you must implement, which function/component/signature must be kept, and whether this modifies an earlier solution — then answer inside that structure. Determine what it actually shows: a conceptual/behavioral question, a coding/implementation problem, or existing code to review/debug/explain. Then respond appropriately for that content — a conceptual question gets a plain-language answer with no code block; a coding problem or a request to modify/debug existing code gets the relevant code. If no explicit question is visible, answer what it most likely asks (e.g. implement the shown stub, or explain/fix the shown code). Do not add a code block just because this is a screenshot.${langNote}`;
+    return `${intro}${typedNote} First decide silently (never write this analysis out — the reply starts with the answer itself) what is being asked, what code/environment is already shown or handled by the platform, which part you must implement, which function/component/signature must be kept, and whether this modifies an earlier solution — then answer inside that structure. Determine what it actually shows: a conceptual/behavioral question, a coding/implementation problem, existing code to review/debug/explain, or finished code that calls its own functions or logs values where the question is what it outputs. Then respond appropriately for that content — a conceptual question gets a plain-language answer with no code block; a coding problem or a request to modify/debug existing code gets the relevant code; a what-does-it-output question gets the full coding answer format (never a prose paragraph): the shown code in the code block with a numbered comment on each call saying what it returns, the Implementation points explaining why each value comes out, and the Example flow listing every call → its exact output in run order. If no explicit question is visible, answer what it most likely asks: implement the shown stub or what the latest request in the conversation asks for, explain/fix the shown code, or — only when nothing is left to implement — what the shown code outputs. Never answer with only a description of the screenshot. Do not add a code block just because this is a screenshot.${langNote}`;
   }
 
-  async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null, { deadline = null } = {}) {
+  async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null, { deadline = null, spoken = false, models = null } = {}) {
     // Called standalone, or as the fallback of a streaming call that passes its
     // own deadline so the whole chain shares one time budget.
     deadline = deadline || this._newDeadline();
@@ -505,9 +608,9 @@ class LLMService {
         requestId: this.requestCount
       });
 
-      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage, { spoken });
 
-      const response = await this._executeWithFallback(geminiRequest, deadline);
+      const response = await this._executeWithFallback(geminiRequest, deadline, models ? { models } : {});
       
       // Enforce language in code fences if programmingLanguage specified
       const finalResponse = programmingLanguage
@@ -549,27 +652,62 @@ class LLMService {
     }
   }
 
-  async processTextWithSkillStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null, onReset = null) {
+  /** Typed chat (and chat text filled in by My Microphone: spoken = true). */
+  async processTextWithSkillStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null, onReset = null, { spoken = false, reasoning = false } = {}) {
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
 
     const startTime = Date.now();
-    const deadline = this._newDeadline();
+    // reasoning: the system design "Build design" turn runs on the reasoning
+    // chain (same models, thinking and time budget as Deep reasoning). An
+    // object overrides parts of it ({ maxOutputTokens } for the build).
+    const reasoningConfig = reasoning
+      ? { ...(config.get('llm.gemini.reasoning') || {}), ...(typeof reasoning === 'object' ? reasoning : {}) }
+      : null;
+    const deadline = reasoningConfig && reasoningConfig.requestBudgetMs ? startTime + reasoningConfig.requestBudgetMs : this._newDeadline();
     this.requestCount++;
+    const req = reqStripper();
 
     try {
-      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage, { spoken });
+      if (reasoningConfig) {
+        this.applyGenerationDefaults(geminiRequest, {
+          maxOutputTokens: reasoningConfig.maxOutputTokens || 8192,
+          thinkingConfig: { thinkingLevel: reasoningConfig.thinkingLevel || 'medium' }
+        });
+      }
 
+      const offerFilter = createImplementFilter((d) => {
+        if (typeof onDelta === 'function' && d) onDelta(d);
+      });
+      const push = req.wrap((d) => offerFilter.push(d));
       const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
+        if (delta) push(delta);
+      }, deadline, {
+        ...(reasoningConfig ? {
+          models: reasoningConfig.models,
+          timeoutMs: reasoningConfig.timeoutMs,
+          firstChunkTimeoutMs: reasoningConfig.firstChunkTimeoutMs,
+          backupFirstChunkTimeoutMs: reasoningConfig.backupFirstChunkTimeoutMs,
+          hedgeAfterMs: reasoningConfig.hedgeAfterMs || 0
+        } : {}),
+        onReset: () => {
+          req.reset();
+          offerFilter.reset();
+          if (typeof onReset === 'function') onReset();
         }
-      }, deadline, { onReset });
+      });
+      req.flush();
+      offerFilter.flush();
 
+      const { body: visible, reqLines } = req.split(fullText);
+      const { offer, body } = splitImplementOffer(visible);
       const finalResponse = programmingLanguage
-        ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
-        : fullText;
+        ? this.enforceProgrammingLanguage(body, programmingLanguage)
+        : body;
+
+      this._warnIfApproachMissing(finalResponse, { source: 'text' });
 
       logger.logPerformance('LLM text streaming', startTime, {
         activeSkill,
@@ -586,7 +724,10 @@ class LLMService {
           processingTime: Date.now() - startTime,
           requestId: this.requestCount,
           usedFallback: false,
-          streamed: true
+          streamed: true,
+          implementOffer: offer,
+          ...(req.active ? { reqLines } : {}),
+          ...(reasoning ? { reasoning: true } : {})
         }
       };
     } catch (error) {
@@ -594,7 +735,7 @@ class LLMService {
         error: error.message,
         requestId: this.requestCount
       });
-      return this.processTextWithSkill(text, activeSkill, sessionMemory, programmingLanguage, { deadline });
+      return withImplementOffer(withReqLines(await this.processTextWithSkill(text, activeSkill, sessionMemory, programmingLanguage, { deadline, spoken, models: reasoningConfig ? reasoningConfig.models : null }), req));
     }
   }
 
@@ -664,6 +805,17 @@ class LLMService {
   }
 
   /**
+   * Coding answers must have an Approach section (answer-format.js); the
+   * fast model used to drop it on short framework answers. Log it when it
+   * still happens so it can be measured — no retry, it would cost latency.
+   */
+  _warnIfApproachMissing(text, context) {
+    if (!codeFormats.solutionCode(text)) return;
+    if (/^\s*(?:#{2,4}\s*|[-*]\s*)?\*{0,2}Approach\b/mi.test(text)) return;
+    logger.warn('Coding answer missing Approach', context);
+  }
+
+  /**
    * Normalize OPENING code fences to the selected programming language tag.
    * Closing fences are left bare (retagging them would turn them into new
    * openers and break the markdown/code extraction), and fences tagged as
@@ -676,8 +828,9 @@ class LLMService {
       const norm = String(programmingLanguage).toLowerCase();
       const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript', typescript: 'typescript', ts: 'typescript' };
       const fenceTag = fenceTagMap[norm] || norm || 'text';
-      // Framework formats keep their own tag (Vue SFC, TSX/JSX, CDN html page).
-      const keepTags = new Set(['text', 'plaintext', 'txt', 'diff', 'bash', 'sh', 'shell', 'console', 'sql', 'json', 'yaml', 'yml', 'xml', 'html', 'css', 'vue', 'tsx', 'jsx']);
+      // Framework formats keep their own tag (Vue SFC, TSX/JSX, CDN html page),
+      // and so do system design mermaid diagrams (drawn by the overlay).
+      const keepTags = new Set(['text', 'plaintext', 'txt', 'diff', 'bash', 'sh', 'shell', 'console', 'sql', 'json', 'yaml', 'yml', 'xml', 'html', 'css', 'vue', 'tsx', 'jsx', 'mermaid']);
 
       let openFence = null; // '```' or '~~~' while inside a code block
       return text.split('\n').map(line => {
@@ -701,14 +854,14 @@ class LLMService {
     }
   }
 
-  buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage) {
+  buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage, { spoken = false } = {}) {
     // Check if we have the new conversation history format
     const sessionManager = require('../managers/session.manager');
-    
+
     if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
       const conversationHistory = sessionManager.getConversationHistory(15);
       const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
-      return this.buildGeminiRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage);
+      return this.buildGeminiRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage, { spoken });
     }
 
     // Fallback to old method for compatibility - now with programming language support
@@ -747,17 +900,18 @@ class LLMService {
     return request;
   }
 
-  buildGeminiRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage) {
+  buildGeminiRequestWithHistory(text, activeSkill, conversationHistory, skillContext, programmingLanguage, { spoken = false } = {}) {
     const request = {
       contents: []
     };
 
     this.applyGenerationDefaults(request);
 
-    // Use the skill prompt from context (which may already include programming language)
+    // Use the skill prompt from context (which may already include programming language).
+    // Chat only: the "did you mean…?" rule (answered in the chat window).
     if (skillContext.skillPrompt) {
       request.systemInstruction = {
-        parts: [{ text: skillContext.skillPrompt }]
+        parts: [{ text: skillContext.skillPrompt + CHAT_CLARIFY_NOTE }]
       };
       
       logger.debug('Using skill context prompt as system instruction', {
@@ -774,7 +928,7 @@ class LLMService {
 
     // The question as typed, like voice. A "Text to analyze:" wrapper here made
     // short follow-ups ("option api") get described instead of answered.
-    const formattedMessage = String(text || '').trim() + this._prepNotes(text, activeSkill, conversationHistory) + getComparisonNote(text);
+    const formattedMessage = String(text || '').trim() + (spoken ? SPOKEN_NOTE : '') + this._prepNotes(text, activeSkill, conversationHistory) + getComparisonNote(text) + systemDesign.getSystemDesignTurnNote();
     if (!formattedMessage || formattedMessage.trim().length === 0) {
       throw new Error('Failed to format user message or message is empty');
     }
@@ -829,7 +983,7 @@ class LLMService {
 
     request.contents.push({
       role: 'user',
-      parts: [{ text: text + this._prepNotes(text, activeSkill, conversationHistory) + getComparisonNote(text) }]
+      parts: [{ text: text + this._prepNotes(text, activeSkill, conversationHistory) + getComparisonNote(text) + systemDesign.getSystemDesignTurnNote() }]
     });
 
     logger.debug('Built intelligent transcription request with conversation history', {
@@ -861,6 +1015,8 @@ class LLMService {
         typeof event.content === 'string' &&
         event.content.trim().length > 0)
       .slice(-limit);
+    // An answer whose question fell outside the window is dropped too.
+    if (events.length && events[0].role === 'model') events.shift();
     let lastModel = -1;
     events.forEach((event, i) => { if (event.role === 'model') lastModel = i; });
     return events.map((event, i) => {
@@ -886,12 +1042,28 @@ class LLMService {
    * to append to the current user turn only. '' when nothing matches, so an
    * unrelated question's request is unchanged. The previous user question
    * from history lets follow-ups ("and where would you create it?") match
-   * within the same exercise.
+   * within the same exercise, and the previous answer tells which project a
+   * follow-up without a project name is about (knowledge.js "carry-over").
    */
-  _prepNotes(question, activeSkill, history = []) {
-    const prev = [...(history || [])].reverse().find(e => e && e.role === 'user' && typeof e.content === 'string');
-    const { ids, block } = matchKnowledge(question, activeSkill, prev ? prev.content : '');
+  _prepNotes(question, activeSkill, history = [], opts = {}) {
+    // [question, answer] turns in order; the last one is the previous turn,
+    // the ones before it let a chain of follow-ups keep its project / app.
+    const turns = [];
+    for (const e of history || []) {
+      if (!e || typeof e.content !== 'string') continue;
+      if (e.role === 'user') turns.push([e.content, '']);
+      else if (e.role === 'model') {
+        // An answer with no question before it (expansion context) still counts.
+        if (turns.length && !turns[turns.length - 1][1]) turns[turns.length - 1][1] = e.content;
+        else turns.push(['', e.content]);
+      }
+    }
+    const [prevQuestion, prevAnswer] = turns.pop() || ['', ''];
+    const { ids, block } = matchKnowledge(question, activeSkill, prevQuestion, prevAnswer, turns, opts);
     if (ids.length) logger.info('Prep notes attached', { ids, chars: block.length });
+    // Logged so a question that should have had notes (e.g. a misheard
+    // project name) can be diagnosed from the log.
+    else logger.info('Prep notes: none', { question: String(question || '').slice(0, 100) });
     return block;
   }
 
@@ -976,6 +1148,7 @@ class LLMService {
           });
 
           modelHealth.recordSuccess(modelName);
+          this.lastModel = modelName;
           return text;
         } catch (error) {
           const errorInfo = this.analyzeError(error);
@@ -1063,7 +1236,21 @@ class LLMService {
    * {response, metadata} shape. Falls back to the non-streaming path on any
    * streaming failure so reliability is never worse than before.
    */
-  async processTranscriptionWithIntelligentResponseStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null, onReset = null) {
+  /**
+   * Interviewer answers. A first line "HEARD: a → b" (the model answered b
+   * for misheard a) never reaches onDelta or the returned response: it goes
+   * to onHeard("a → b") and to metadata.heard. A "CLARIFY: Did you mean …?"
+   * reply (a coding request with a genuinely unclear term) never reaches
+   * onDelta either: it comes back as metadata.clarify (the question line).
+   * Both are spotted in the same first characters that were already held
+   * back for HEARD, so a normal answer isn't delayed.
+   * A coding answer (its first line is the "**Understanding**" heading) after
+   * a HEARD note that names other readings ("a → b | c") is turned into the
+   * same question (heardCodingQuestion): the model wasn't sure which change
+   * was asked for. onClarify(question) fires as soon as that's known; the
+   * unused answer finishes without being shown.
+   */
+  async processTranscriptionWithIntelligentResponseStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null, onReset = null, { onHeard = null, onClarify = null } = {}) {
     if (!this.isInitialized) {
       throw new Error('LLM service not initialized. Check Gemini API key configuration.');
     }
@@ -1072,18 +1259,105 @@ class LLMService {
     const deadline = this._newDeadline();
     this.requestCount++;
 
+    // Hold the first characters until it's clear whether they are a HEARD
+    // line or a CLARIFY question; then pass everything after it through
+    // unchanged. The line after a HEARD note may still be a question.
+    let state = 'pending'; // → 'note' (inside the HEARD line) → 'afterNote' → 'pass', or 'clarify'
+    let held = '';
+    let noteLine = null;
+    let gateQuestion = null; // set when a HEARD note + coding answer became a question
+    // Everything shown passes the REQ-block filter (system design mode) and
+    // then the IMPLEMENT-line filter last.
+    const offerFilter = createImplementFilter((d) => { if (typeof onDelta === 'function' && d) onDelta(d); });
+    const req = reqStripper();
+    const emit = req.wrap((d) => offerFilter.push(d));
+    const isCodingStart = (t) => /^\s*\*\*Understanding\*\*/i.test(t);
+    const heard = (note) => { if (note && typeof onHeard === 'function') onHeard(note); };
+
     try {
       const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
 
       const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
+        if (!delta) return;
+        if (state === 'pass') return emit(delta);
+        held += delta;
+        if (state === 'clarify') return;
+        if (state === 'pending') {
+          const kind = markerState(held, HEARD_PREFIX);
+          const ask = clarifyState(held);
+          if (ask === 'yes') { state = 'clarify'; return; }
+          if (kind === 'maybe' || ask === 'maybe') return;
+          if (kind === 'no') { state = 'pass'; emit(held); held = ''; return; }
+          state = 'note';
         }
-      }, deadline, { onReset });
+        if (state === 'note') {
+          if (!held.includes('\n') && held.length <= 400) return;
+          const { note, body } = splitHeardNote(held.includes('\n') ? held : held + '\n');
+          noteLine = note;
+          held = body;
+          state = 'afterNote';
+        }
+        const ask = clarifyState(held);
+        if (ask === 'yes') { state = 'clarify'; return; }
+        if (ask === 'maybe') return;
+        const gate = isCodingStart(held) ? heardCodingQuestion(noteLine) : null;
+        if (gate) {
+          gateQuestion = gate;
+          state = 'clarify';
+          if (typeof onClarify === 'function') onClarify(gate);
+          return;
+        }
+        heard(noteLine);
+        state = 'pass';
+        emit(held);
+        held = '';
+      }, deadline, {
+        onReset: () => {
+          state = 'pending';
+          held = '';
+          noteLine = null;
+          gateQuestion = null;
+          req.reset();
+          offerFilter.reset();
+          if (typeof onReset === 'function') onReset();
+        }
+      });
 
+      const { note, body: heardBody } = splitHeardNote(fullText);
+      const { body: visible, reqLines } = req.split(heardBody);
+      const { offer, body } = splitImplementOffer(visible);
+      const gate = gateQuestion || (isCodingStart(body) ? heardCodingQuestion(note) : null);
+      if (clarifyState(body) === 'yes' || gate) {
+        const clarify = gate || clarifyQuestion(body);
+        logger.info('Interviewer coding request needs a clarification', { clarify, requestId: this.requestCount });
+        return {
+          response: '',
+          metadata: {
+            skill: activeSkill,
+            programmingLanguage,
+            processingTime: Date.now() - startTime,
+            requestId: this.requestCount,
+            usedFallback: false,
+            streamed: true,
+            isTranscriptionResponse: true,
+            heard: null,
+            clarify
+          }
+        };
+      }
+
+      if (state !== 'pass') {
+        // A short answer that ended while still held back.
+        heard(note);
+        emit(body);
+      }
+      req.flush();
+      offerFilter.flush();
       const finalResponse = programmingLanguage
-        ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
-        : fullText;
+        ? this.enforceProgrammingLanguage(body, programmingLanguage)
+        : body;
+
+      this._warnIfApproachMissing(finalResponse, { source: 'transcription' });
 
       logger.logPerformance('LLM transcription streaming', startTime, {
         activeSkill,
@@ -1101,7 +1375,10 @@ class LLMService {
           requestId: this.requestCount,
           usedFallback: false,
           streamed: true,
-          isTranscriptionResponse: true
+          isTranscriptionResponse: true,
+          heard: note,
+          implementOffer: offer,
+          ...(req.active ? { reqLines } : {})
         }
       };
     } catch (error) {
@@ -1111,7 +1388,14 @@ class LLMService {
       });
       // Non-streaming path returns the same shape; the caller renders it as a
       // single final response.
-      return this.processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory, programmingLanguage, { deadline });
+      const result = await this.processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory, programmingLanguage, { deadline });
+      const { note, body } = splitHeardNote(result.response);
+      const gate = /^\s*\*\*Understanding\*\*/i.test(body) ? heardCodingQuestion(note) : null;
+      if (clarifyState(body) === 'yes' || gate) {
+        return { ...result, response: '', metadata: { ...result.metadata, heard: null, clarify: gate || clarifyQuestion(body) } };
+      }
+      heard(note);
+      return withImplementOffer(withReqLines({ ...result, response: body, metadata: { ...result.metadata, heard: note } }, req));
     }
   }
 
@@ -1128,6 +1412,18 @@ class LLMService {
    *   is set on a converted solution (its code-formats.js id)
    * @param {'details'|'deep'|'optimized'|string} mode - or 'convert:<format id>'
    */
+  /**
+   * Context for an expansion's notes: the question asked before this one
+   * ("I meant for Speeqr" re-asks it) and this record's own answer, which
+   * names the project the question was about.
+   */
+  _expansionNotesContext(record) {
+    return [
+      ...(record.prevQuestion ? [{ role: 'user', content: record.prevQuestion }] : []),
+      { role: 'model', content: record.answer }
+    ];
+  }
+
   buildExpansionRequest(record, mode = 'details') {
     if (!record || !record.answer) {
       throw new Error('Expansion request needs the original answer');
@@ -1146,6 +1442,12 @@ class LLMService {
     }
 
     const images = record.kind === 'image' && Array.isArray(record.images) ? record.images : [];
+    const notes = images.length ? '' : this._prepNotes(record.question, record.skill, this._expansionNotesContext(record), { expansion: true });
+    // A career answer ("tell me about yourself") got its projects' architecture
+    // notes (knowledge/interview/career-walkthrough.md); the layout is restated
+    // in the turn because the lite models kept the short behavioral shape when
+    // it was only in the system prompt (2026-10-02).
+    const career = notes.includes('### Career walkthrough — ');
     const questionParts = images.length
       ? [
           { text: this.formatImageInstruction(record.skill, record.programmingLanguage, { count: images.length, text: record.question }) },
@@ -1154,7 +1456,7 @@ class LLMService {
             { inlineData: { data: img.buffer.toString('base64'), mimeType: img.mimeType || 'image/png' } }
           ])
         ]
-      : [{ text: (String(record.question || '').trim() || '(question not available)') + this._prepNotes(record.question, record.skill) }];
+      : [{ text: (String(record.question || '').trim() || '(question not available)') + notes }];
 
     const ask = convertTo ? `Convert this solution to ${convertTo.label}.`
       : optimized ? 'Give the optimized solution.'
@@ -1163,7 +1465,14 @@ class LLMService {
       // prompt (2026-09-28).
       : deep ? (/```/.test(record.answer)
         ? 'Deep reasoning review of this answer, please. Start with `### Solution — … (reviewed)` containing the code above copied verbatim with its deeper Approach, Implementation, step-by-step Complexity and Edge cases; then `### Improved — …` only if a meaningful fix to the same approach exists, otherwise "Possible improvements" bullets.'
+        : career ? 'Deep reasoning review of this answer, please: keep my exact `### Company — role, dates` and `#### Project` headings and go deeper on the architecture, key decisions and trade-offs of every project, down to the last one.'
         : 'Deep reasoning review of this answer, please.')
+      : career ? 'More details, please: go deeper on the architecture of every project in my answer, down to the last one. Keep my exact `### Company — role, dates` and `#### Project` headings; under each project, a ```text flow, the layers with their libraries and where my features sit, and one **The Why:** line. Much longer than my answer.'
+      // An answer with a text flow and no code (architecture / "my work"):
+      // the lite models drew a flow in only 3 of 10 More details answers when
+      // the rule sat in EXPANSION_NOTE, and once merged the two GORA apps on
+      // one line (`TanStack Query / Axios`), so it's restated here (2026-10-02).
+      : hasTextFlowOnly(record.answer) ? 'More details, please. Include a ```text flow drawn fresh from the reference notes, not the one above: one hop per line, a separate flow per app (apps that share a backend may meet there, each on its own line), and only that app\'s own tools in it.'
       : 'More details, please.';
     // A converted solution answers the original question in another format;
     // without pinning it, the question ("…in Vue 3") and the Implementation
@@ -1217,17 +1526,25 @@ class LLMService {
     this.requestCount++;
 
     const geminiRequest = this.buildExpansionRequest(record, mode);
+    // System design requirement stage: an expansion of a stage-1 answer may
+    // end with the REQ block too; it's never shown.
+    const req = reqStripper();
+    const onResetAll = () => {
+      req.reset();
+      if (typeof onReset === 'function') onReset();
+    };
 
     let fullText;
     let streamed = true;
     try {
       // Reasoning models think before their first token, so they get their
       // own first-chunk allowance before moving to the next model.
-      fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
+      fullText = await this.executeStreamingRequest(geminiRequest, req.wrap((delta) => {
         if (typeof onDelta === 'function' && delta) {
           onDelta(delta);
         }
-      }, deadline, reasoning ? { ...modelOptions, firstChunkTimeoutMs: reasoning.firstChunkTimeoutMs, backupFirstChunkTimeoutMs: reasoning.backupFirstChunkTimeoutMs, onReset } : { onReset });
+      }), deadline, reasoning ? { ...modelOptions, firstChunkTimeoutMs: reasoning.firstChunkTimeoutMs, backupFirstChunkTimeoutMs: reasoning.backupFirstChunkTimeoutMs, hedgeAfterMs: reasoning.hedgeAfterMs || 0, onReset: onResetAll } : { onReset: onResetAll });
+      req.flush();
     } catch (error) {
       logger.warn('Streaming expansion failed, falling back to non-streaming', {
         error: error.message,
@@ -1242,9 +1559,12 @@ class LLMService {
       }
     }
 
+    fullText = req.split(fullText).body;
     const finalResponse = record.programmingLanguage
       ? this.enforceProgrammingLanguage(fullText, record.programmingLanguage)
       : fullText;
+
+    if (mode !== 'details') this._warnIfApproachMissing(finalResponse, { source: 'expansion', mode });
 
     logger.logPerformance('LLM expansion', startTime, {
       activeSkill: record.skill,
@@ -1294,8 +1614,11 @@ class LLMService {
    * as executeRequest. Accumulates and returns the full text; invokes onDelta
    * for each chunk.
    */
-  async executeStreamingRequest(geminiRequest, onDelta, deadline = null, { firstChunkTimeoutMs = null, backupFirstChunkTimeoutMs = null, models = null, timeoutMs = null, onReset = null } = {}) {
+  async executeStreamingRequest(geminiRequest, onDelta, deadline = null, { firstChunkTimeoutMs = null, backupFirstChunkTimeoutMs = null, models = null, timeoutMs = null, onReset = null, hedgeAfterMs = null } = {}) {
     const firstChunkMs = firstChunkTimeoutMs || config.get('llm.gemini.firstChunkTimeoutMs') || 0;
+    // Normal answer chain only (an explicit model list is the reasoning
+    // chain, whose models think for seconds before their first token).
+    const hedgeMs = hedgeAfterMs !== null ? hedgeAfterMs : (models ? 0 : (config.get('llm.gemini.hedgeAfterMs') || 0));
     // Models after the first may get a shorter allowance (fast backups).
     const backupFirstChunkMs = backupFirstChunkTimeoutMs || firstChunkMs;
     const maxRetries = config.get('llm.gemini.maxRetries');
@@ -1320,8 +1643,31 @@ class LLMService {
     };
 
     let lastError = null;
+    let queue = modelsToTry;
 
-    for (const modelName of modelsToTry) {
+    // Hedged first attempt: if the first model sends nothing within hedgeMs,
+    // the next one starts in parallel and whichever streams first is shown.
+    if (hedgeMs > 0 && (!firstChunkMs || hedgeMs < firstChunkMs) && modelsToTry.length > 1 && !this._deadlinePassed(deadline)) {
+      resetShownText();
+      try {
+        const { text, model } = await this._hedgedAttempt(geminiRequest, modelsToTry[0], modelsToTry[1], emit, {
+          apiKey, firstChunkMs, backupFirstChunkMs, hedgeMs, timeoutMs
+        });
+        modelHealth.recordSuccess(model);
+        this.lastModel = model;
+        return text;
+      } catch (error) {
+        lastError = error;
+        const tried = error.triedModels || [modelsToTry[0]];
+        queue = modelsToTry.filter(m => !tried.includes(m));
+        if (!queue.length) {
+          resetShownText();
+          throw error;
+        }
+      }
+    }
+
+    for (const modelName of queue) {
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         // Don't start a new attempt once the request's time budget is spent.
         if (lastError && this._deadlinePassed(deadline)) {
@@ -1345,6 +1691,7 @@ class LLMService {
           });
 
           modelHealth.recordSuccess(modelName);
+          this.lastModel = modelName;
           return fullText;
         } catch (error) {
           const errorInfo = this.analyzeError(error);
@@ -1370,7 +1717,7 @@ class LLMService {
             error.message.includes('NOT_FOUND') ||
             error.message.includes('no longer available');
 
-          if (isModelUnavailable && modelName !== modelsToTry[modelsToTry.length - 1]) {
+          if (isModelUnavailable && modelName !== queue[queue.length - 1]) {
             break; // try next fallback model
           }
 
@@ -1392,7 +1739,141 @@ class LLMService {
     throw lastError || new Error('Gemini streaming request failed');
   }
 
-  _streamRequestForModel(geminiRequest, modelName, apiKey, onDelta, firstChunkMs = 0, timeoutMs = null) {
+  /**
+   * One attempt raced across two models: `primary` starts now, `backup` after
+   * hedgeMs of silence from it (or right away if `primary` fails first). The
+   * first model to stream text wins and is the only one shown; the other is
+   * aborted. A primary that lost this way is recorded as silent, so the next
+   * questions skip it and the background probe (model-monitor.js) brings it
+   * back. Rejects with `triedModels` — the models that really failed — so the
+   * caller continues with the rest of the chain.
+   * @returns {Promise<{text: string, model: string}>}
+   */
+  _hedgedAttempt(geminiRequest, primary, backup, emit, { apiKey, firstChunkMs, backupFirstChunkMs, hedgeMs, timeoutMs }) {
+    return new Promise((resolve, reject) => {
+      const runs = new Map(); // model → { abort, settled }
+      const failed = [];
+      let winner = null;
+      let lastError = null;
+      let finished = false;
+      let hedgeTimer = null;
+
+      const finish = (fn, value) => {
+        if (finished) return;
+        finished = true;
+        if (hedgeTimer) clearTimeout(hedgeTimer);
+        fn(value);
+      };
+      const running = () => [...runs.values()].filter(r => !r.settled).length;
+      const failAll = () => {
+        const err = lastError || new Error('Hedged Gemini request failed');
+        err.triedModels = [...failed];
+        finish(reject, err);
+      };
+      const onFailure = (model) => {
+        if (!winner && model === primary) start(backup, backupFirstChunkMs);
+        if (!running()) failAll();
+      };
+
+      const start = (model, fcMs) => {
+        if (runs.has(model) || finished) return;
+        const run = { abort: null, settled: false };
+        runs.set(model, run);
+        if (model === backup) {
+          logger.info('Primary model slow or failing; starting the backup', { primary, backup, afterMs: hedgeMs });
+        }
+        this._streamRequestForModel(this._requestForModel(geminiRequest, model), model, apiKey, (piece) => {
+          if (!winner) {
+            winner = model;
+            if (hedgeTimer) { clearTimeout(hedgeTimer); hedgeTimer = null; }
+            for (const [other, r] of runs) {
+              if (other === model || r.settled) continue;
+              r.settled = true;
+              if (r.abort) r.abort();
+              if (other === primary) {
+                // Lost the race without sending anything: treat like a silent
+                // model (and don't retry it if the winner breaks off later).
+                failed.push(primary);
+                modelHealth.recordFailure(primary, Object.assign(new Error(`No response from ${primary} before ${backup} answered (hedged)`), { firstChunkTimeout: true }));
+              }
+            }
+            if (model === backup) logger.info('Backup model answered first', { primary, backup });
+          }
+          if (winner === model) emit(piece);
+        }, fcMs, timeoutMs, (abort) => { run.abort = abort; })
+          .then((text) => {
+            run.settled = true;
+            if (winner === model && text) {
+              finish(resolve, { text, model });
+              return;
+            }
+            if (winner && winner !== model) return;
+            lastError = new Error('Empty streamed response from Gemini API');
+            failed.push(model);
+            onFailure(model);
+          })
+          .catch((error) => {
+            if (error && error.aborted) return;
+            run.settled = true;
+            if (winner && winner !== model) return;
+            lastError = error;
+            failed.push(model);
+            modelHealth.recordFailure(model, error);
+            logger.warn(`Gemini streaming attempt 1 failed for model ${model}`, { error: error.message, model, hedged: true });
+            if (winner === model) {
+              failAll(); // broke off mid-answer; the other run was already aborted
+              return;
+            }
+            onFailure(model);
+          });
+      };
+
+      start(primary, firstChunkMs);
+      hedgeTimer = setTimeout(() => {
+        hedgeTimer = null;
+        if (!winner) start(backup, backupFirstChunkMs);
+      }, hedgeMs);
+    });
+  }
+
+  /**
+   * Tiny request that tells whether a model answers quickly right now (used by
+   * src/services/model-monitor.js so a real question never has to find out).
+   * Records the result in model health.
+   * @returns {Promise<{ok: boolean, ms: number, error?: string, recorded?: boolean}>}
+   */
+  async probeModel(model) {
+    const probe = config.get('llm.gemini.probe') || {};
+    const apiKey = config.getApiKey('GEMINI');
+    // A model only in the reasoning chain (Deep reasoning / Optimized) is a
+    // thinking model: it gets the smallest thinking level instead of budget 0
+    // (a 400 is never recorded, so a rejected probe would never bring it back)
+    // and a little longer to its first chunk.
+    const reasoningOnly = !this._modelsToTry().includes(model)
+      && ((config.get('llm.gemini.reasoning') || {}).models || []).includes(model);
+    const request = this._requestForModel({
+      contents: [{ role: 'user', parts: [{ text: 'Say hi.' }] }],
+      generationConfig: { maxOutputTokens: 16, thinkingConfig: reasoningOnly ? { thinkingLevel: 'minimal' } : { thinkingBudget: 0 } }
+    }, model);
+    const firstChunkMs = reasoningOnly
+      ? (probe.reasoningFirstChunkTimeoutMs || 8000)
+      : (probe.firstChunkTimeoutMs || 5000);
+    const t0 = Date.now();
+    try {
+      await this._streamRequestForModel(request, model, apiKey, null, firstChunkMs, probe.timeoutMs || 10000);
+      const ms = Date.now() - t0;
+      modelHealth.recordSuccess(model);
+      logger.info('Model probe answered', { model, ms });
+      return { ok: true, ms };
+    } catch (error) {
+      const ms = Date.now() - t0;
+      const verdict = modelHealth.recordFailure(model, error);
+      logger.info('Model probe failed', { model, ms, error: String(error.message).slice(0, 160), recorded: !!verdict });
+      return { ok: false, ms, error: String(error.message).slice(0, 200), recorded: !!verdict };
+    }
+  }
+
+  _streamRequestForModel(geminiRequest, modelName, apiKey, onDelta, firstChunkMs = 0, timeoutMs = null, onRequest = null) {
     const https = require('https');
     const timeout = timeoutMs || config.get('llm.gemini.timeout');
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse`;
@@ -1555,6 +2036,17 @@ class LLMService {
           reject(err);
           req.destroy();
         }, firstChunkMs);
+      }
+
+      // Lets a hedged race cancel the attempt it no longer needs.
+      if (typeof onRequest === 'function') {
+        onRequest(() => {
+          clearFirstChunkTimer();
+          if (settled) return;
+          settled = true;
+          req.destroy();
+          reject(Object.assign(new Error(`Streaming request to ${modelName} aborted`), { aborted: true }));
+        });
       }
 
       req.on('error', (error) => {
@@ -1928,6 +2420,7 @@ class LLMService {
       try {
         const result = await this._executeAlternativeRequestForModel(this._requestForModel(geminiRequest, modelName), modelName, apiKey, timeoutMs);
         modelHealth.recordSuccess(modelName);
+        this.lastModel = modelName;
         return result;
       } catch (error) {
         lastError = error;

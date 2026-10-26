@@ -55,6 +55,49 @@
         gap: 8px;
         text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
       }
+      /* Model status line under the header */
+      .model-bar {
+        -webkit-app-region: no-drag;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 20px;
+        min-height: 26px;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.72);
+        background: rgba(0, 0, 0, 0.14);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        flex-shrink: 0;
+      }
+      .model-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        flex-shrink: 0;
+        background: rgba(255, 255, 255, 0.35);
+      }
+      .model-dot.ok { background: #34d399; }
+      .model-dot.warn { background: #fbbf24; }
+      .model-dot.bad { background: #f87171; }
+      .model-status-text {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .model-retry {
+        background: rgba(255, 255, 255, 0.12);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        color: rgba(255, 255, 255, 0.9);
+        border-radius: 5px;
+        padding: 2px 8px;
+        font-size: 11px;
+        cursor: pointer;
+        flex-shrink: 0;
+      }
+      .model-retry:hover { background: rgba(255, 255, 255, 0.22); }
+      .model-retry:disabled { opacity: 0.5; cursor: default; }
       /* Header actions (e.g., Clear History) */
       .header-actions {
         -webkit-app-region: no-drag;
@@ -75,6 +118,55 @@
         background: rgba(255, 255, 255, 0.22);
         color: #fff;
       }
+      /* Requirements card (system design mode, toggled from the top bar's
+         sitemap button): pinned under the model bar while the mode is on */
+      .sd-card {
+        -webkit-app-region: no-drag;
+        flex-shrink: 0;
+        max-height: 38vh;
+        overflow-y: auto;
+        padding: 8px 20px 10px;
+        font-size: 12px;
+        line-height: 1.45;
+        color: rgba(255, 255, 255, 0.88);
+        background: rgba(100, 255, 218, 0.06);
+        border-bottom: 1px solid rgba(100, 255, 218, 0.25);
+      }
+      .sd-card[hidden] { display: none; }
+      /* Title row + buttons stay visible while the lists scroll */
+      .sd-card-head {
+        position: sticky;
+        top: -8px;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: -8px -20px 4px;
+        padding: 8px 20px 6px;
+        background: rgba(16, 32, 36, 0.96);
+      }
+      .sd-card-title { font-weight: 600; color: #64ffda; }
+      .sd-stage { font-size: 11px; opacity: 0.75; }
+      .sd-problem { opacity: 0.85; margin-bottom: 4px; }
+      .sd-section { margin: 4px 0 2px; }
+      .sd-section-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.6; }
+      .sd-section ul { margin: 1px 0 0 16px; padding: 0; }
+      .sd-section li { margin: 0; }
+      .sd-empty { opacity: 0.6; font-style: italic; }
+      .sd-actions { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+      .sd-chip {
+        background: rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(100, 255, 218, 0.45);
+        border-radius: 4px;
+        padding: 3px 9px;
+        font-size: 12px;
+        color: #64ffda;
+        cursor: pointer;
+      }
+      .sd-chip:hover:not(:disabled) { background: rgba(100, 255, 218, 0.18); border-color: #64ffda; }
+      .sd-chip:disabled { cursor: default; opacity: 0.45; }
+      .sd-chip.primary { background: rgba(100, 255, 218, 0.16); font-weight: 600; }
       .recording-indicator {
         width: 8px;
         height: 8px;
@@ -159,6 +251,60 @@
       }
       .message.user {
         background: rgba(255, 152, 0, 0.1);
+      }
+      /* "Did you mean …?" — waiting for the next message as the reply */
+      .message.clarify {
+        background: rgba(255, 193, 7, 0.14);
+        border-left: 3px solid #ffc107;
+      }
+      /* "Heard X → answered as Y" — the interviewer's words were reinterpreted */
+      .message.heard {
+        background: rgba(0, 188, 212, 0.1);
+        border-left: 3px solid #00bcd4;
+      }
+      /* "Could change: …" — a reasoning answer offers a code change */
+      .message.offer {
+        background: rgba(76, 175, 80, 0.12);
+        border-left: 3px solid #4caf50;
+      }
+      .message.clarify code, .message.heard code, .message.offer code {
+        background: rgba(0, 0, 0, 0.3);
+        padding: 1px 4px;
+        border-radius: 3px;
+        font-family: 'Monaco', 'Menlo', monospace;
+        color: #64ffda;
+      }
+      /* A "Did you mean …?" guess: click to send it as the reply */
+      .suggestion-chip {
+        background: rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(100, 255, 218, 0.45);
+        border-radius: 4px;
+        padding: 1px 6px;
+        margin: 1px 0;
+        font-family: 'Monaco', 'Menlo', monospace;
+        font-size: inherit;
+        color: #64ffda;
+        cursor: pointer;
+      }
+      .suggestion-chip:hover:not(:disabled) {
+        background: rgba(100, 255, 218, 0.18);
+        border-color: #64ffda;
+      }
+      .suggestion-chip:disabled {
+        cursor: default;
+        opacity: 0.45;
+      }
+      .heard-alternatives {
+        margin-top: 6px;
+        font-size: 12px;
+        opacity: 0.9;
+      }
+      .heard-alternatives .suggestion-chip {
+        margin-right: 4px;
+      }
+      .suggestion-chip.chosen:disabled {
+        opacity: 1;
+        background: rgba(100, 255, 218, 0.22);
       }
       .message.assistant {
         background: rgba(156, 39, 176, 0.1);
@@ -428,6 +574,14 @@
         padding: 8px 12px;
         border: 1px solid rgba(255, 255, 255, 0.15);
         -webkit-app-region: no-drag;
+      }
+      /* Brief highlight when My Microphone text lands in the input box */
+      .input-field.mic-filled {
+        animation: micFilled 1.2s ease-out;
+      }
+      @keyframes micFilled {
+        from { background: rgba(76, 175, 80, 0.35); }
+        to { background: transparent; }
       }
       .input-field {
         flex: 1;
@@ -738,6 +892,16 @@
         </div>
       </div>
 
+      <!-- Which Gemini model answers right now (src/services/model-monitor.js) -->
+      <div class="model-bar" id="modelBar">
+        <span class="model-dot" id="modelDot"></span>
+        <span class="model-status-text" id="modelStatusText">Checking model…</span>
+        <button class="model-retry" id="modelRetryBtn" type="button" hidden></button>
+      </div>
+
+      <!-- System design round: requirements so far + Build design (shown only while the mode is on) -->
+      <div class="sd-card" id="sdCard" hidden></div>
+
       <!-- Interim Text Overlay -->
       <div class="interim-overlay" id="interimOverlay"></div>
 
@@ -915,13 +1079,157 @@
         });
       }
       
-      // Also capture generic LLM responses (from OCR/screenshot flows)
+      // Answers are shown in the AI Response window only; the chat keeps the
+      // questions and statuses, so a finished answer is just a status line.
+      function markAnswered(data) {
+        try { hideThinkingIndicator(); } catch (_) {}
+        if (!data || typeof data.response !== 'string' || !data.response.trim()) return;
+        // One status line per answer, even if the same answer arrives twice.
+        const h = data.messageId || hashString(data.response.trim());
+        if (recentResponseHashes.has(h)) return;
+        recentResponseHashes.add(h);
+        if (recentResponseHashes.size > RECENT_HASH_LIMIT) {
+          recentResponseHashes.delete(recentResponseHashes.values().next().value);
+        }
+        addMessage('Answered in response window', 'system');
+      }
+
       if (whysperAPI && whysperAPI.onLlmResponse) {
-        whysperAPI.onLlmResponse((event, data) => {
+        whysperAPI.onLlmResponse((event, data) => markAnswered(data));
+      }
+
+      if (whysperAPI && whysperAPI.onLlmError) {
+        whysperAPI.onLlmError((event, data) => {
           try { hideThinkingIndicator(); } catch (_) {}
-          if (data && data.response) {
-            renderAssistantResponse(data.response);
-          }
+          addMessage(`Answer failed${data && data.error ? `: ${data.error}` : ''}`, 'error');
+        });
+      }
+
+      // A chat coding request named something unclear: main asks "Did you
+      // mean …?" here instead of answering; the next message is the reply.
+      const DEFAULT_PLACEHOLDER = messageInput ? messageInput.placeholder : '';
+      if (whysperAPI && whysperAPI.onChatClarification) {
+        whysperAPI.onChatClarification((event, data) => {
+          try { hideThinkingIndicator(); } catch (_) {}
+          const text = data && typeof data.text === 'string' ? data.text.trim() : '';
+          if (!text) return;
+          // From Meeting Audio: the interviewer's coding request, not built
+          // yet; the previous answer stays in the response window.
+          addMessage(data.source === 'voice' ? `🤔 Interviewer: ${text}` : `🤔 ${text}`, 'clarify');
+          if (messageInput) messageInput.placeholder = 'Reply yes, or type what you meant…';
+        });
+      }
+      // A newer interviewer question replaced it: its buttons are spent.
+      if (whysperAPI && whysperAPI.onChatClarificationExpired) {
+        whysperAPI.onChatClarificationExpired(() => {
+          if (chatMessages) chatMessages.querySelectorAll('.message.clarify .suggestion-chip').forEach(c => { c.disabled = true; });
+          if (messageInput) messageInput.placeholder = DEFAULT_PLACEHOLDER;
+        });
+      }
+
+      // The interviewer's words were answered as a different term (the answer
+      // is already in the response window). "a → b | c, d" also names other
+      // terms the sound fits: each is a button that re-asks with it. If the
+      // guess is wrong another way, type the right question here.
+      if (whysperAPI && whysperAPI.onVoiceHeardNote) {
+        whysperAPI.onVoiceHeardNote((event, data) => {
+          const note = data && typeof data.text === 'string' ? data.text.trim() : '';
+          if (!note) return;
+          const [main, altText = ''] = note.split(/\s+\|\s+/);
+          const parts = main.split(/\s*(?:→|->)\s*/);
+          const heard = parts[0].replace(/^["“'`]+|["”'`]+$/g, '');
+          const answered = parts.slice(1).join(' → ');
+          addMessage(parts.length > 1 && answered
+            ? `🎧 Heard "${heard}" → answered as ${answered}`
+            : `🎧 ${main}`, 'heard');
+          const alts = heardAlternatives(altText, answered);
+          if (alts.length) addHeardChips(alts, answered);
+        });
+      }
+
+      // A "why didn't you use X?" answer (in the response window) offers that
+      // change: one button sends it as a normal chat follow-up, which builds
+      // the full code. Spent once anything is sent, like the other buttons; a
+      // bubble restored from history is plain text.
+      if (whysperAPI && whysperAPI.onChatImplementOffer) {
+        whysperAPI.onChatImplementOffer((event, data) => {
+          const offer = data && typeof data.text === 'string' ? data.text.trim() : '';
+          if (!offer) return;
+          addMessage(`💡 Could change: ${offer}`, 'offer');
+          const bubble = chatMessages && chatMessages.lastElementChild;
+          if (!bubble) return;
+          const row = document.createElement('div');
+          row.className = 'heard-alternatives';
+          const chip = document.createElement('button');
+          chip.type = 'button';
+          chip.className = 'suggestion-chip implement-chip';
+          chip.textContent = 'Implement this';
+          chip.title = 'Write the full code with this change';
+          chip.addEventListener('click', () => {
+            if (chip.disabled) return;
+            disableSuggestions();
+            chip.classList.add('chosen');
+            sendText(`Implement it: ${offer}`, { spoken: false });
+          });
+          row.appendChild(chip);
+          bubble.appendChild(row);
+        });
+      }
+
+      // Other terms from the note, without repeats of the answered term
+      // ("Next.js page" next to "Next.js") or of each other.
+      function heardAlternatives(altText, answered) {
+        const plain = (t) => t.replace(/`/g, '').trim().toLowerCase();
+        const seen = [plain(answered)];
+        return altText.split(/\s*,\s*/).map(t => t.replace(/`/g, '').trim()).filter(t => {
+          const p = plain(t);
+          if (!p || seen.some(s => s && (s.includes(p) || p.includes(s)))) return false;
+          seen.push(p);
+          return true;
+        }).slice(0, 2);
+      }
+
+      // "Meant instead:" buttons under the last heard note. A click asks the
+      // interviewer's question again with that term, through chat.
+      function addHeardChips(alts, answered) {
+        const bubble = chatMessages && chatMessages.lastElementChild;
+        if (!bubble) return;
+        const row = document.createElement('div');
+        row.className = 'heard-alternatives';
+        row.appendChild(document.createTextNode('Meant instead: '));
+        alts.forEach(alt => {
+          const chip = document.createElement('button');
+          chip.type = 'button';
+          chip.className = 'suggestion-chip';
+          chip.textContent = alt;
+          chip.title = 'Answer the question again with this term';
+          chip.addEventListener('click', () => {
+            if (chip.disabled) return;
+            disableSuggestions();
+            chip.classList.add('chosen');
+            sendText(answered ? `I meant ${alt}, not ${answered}` : `I meant ${alt}`, { spoken: false });
+          });
+          row.appendChild(chip);
+        });
+        bubble.appendChild(row);
+      }
+
+      // My Microphone: the transcript lands in the input box to edit and
+      // send by hand (Enter / Send); it is never sent automatically. The
+      // message is flagged as spoken so misheard words are read that way.
+      let inputFromMic = false;
+      if (whysperAPI && whysperAPI.onMicTranscriptToInput) {
+        whysperAPI.onMicTranscriptToInput((event, data) => {
+          const text = data && typeof data.text === 'string' ? data.text.trim() : '';
+          if (!text || !messageInput) return;
+          inputFromMic = true;
+          const current = messageInput.value.replace(/\s+$/, '');
+          messageInput.value = current ? `${current} ${text}` : text;
+          autoGrow(messageInput);
+          messageInput.scrollTop = messageInput.scrollHeight;
+          messageInput.classList.remove('mic-filled');
+          void messageInput.offsetWidth; // restart the flash animation
+          messageInput.classList.add('mic-filled');
         });
       }
 
@@ -957,6 +1265,13 @@
         if (type === 'assistant') {
           textDiv.innerHTML = formatMarkdown(text);
           if (window.renderMathInElement) window.renderMathInElement(textDiv);
+        } else if (type === 'clarify' && !skipPersist) {
+          renderSuggestions(textDiv, text);
+        } else if (type === 'clarify' || type === 'heard' || type === 'offer') {
+          // Plain text, with `inline code` shown as code. A clarify bubble
+          // restored from history isn't clickable: main no longer has the
+          // question it belongs to.
+          textDiv.innerHTML = escapeHtml(text).replace(/`([^`]+)`/g, '<code>$1</code>');
         } else {
           textDiv.textContent = text;
         }
@@ -973,10 +1288,65 @@
         }
       }
 
+      // "Did you mean `a`, `b` or `c`?": each guess is a button that sends
+      // it as the reply, so nothing has to be typed mid-interview. Without
+      // backticks the phrase after "Did you mean" is the one guess.
+      function renderSuggestions(textDiv, text) {
+        const parts = text.split(/`([^`]+)`/);
+        if (parts.length === 1) {
+          const m = /^(.*?\bDid you mean\s+)(.+?)(\?\s*)$/i.exec(text);
+          if (m) parts.splice(0, 1, m[1], m[2], m[3]);
+        }
+        parts.forEach((part, i) => {
+          if (i % 2 === 0) {
+            if (part) textDiv.appendChild(document.createTextNode(part));
+            return;
+          }
+          const chip = document.createElement('button');
+          chip.type = 'button';
+          chip.className = 'suggestion-chip';
+          chip.textContent = part.trim();
+          chip.title = 'Send this as the reply';
+          chip.addEventListener('click', () => {
+            if (chip.disabled) return;
+            disableSuggestions();
+            chip.classList.add('chosen');
+            sendText(chip.textContent, { spoken: false });
+          });
+          textDiv.appendChild(chip);
+        });
+      }
+
+      // Main uses a "Did you mean" question only for the next message, so
+      // once anything is sent the old guesses are spent.
+      function disableSuggestions() {
+        if (!chatMessages) return;
+        chatMessages.querySelectorAll('.suggestion-chip').forEach(c => { c.disabled = true; });
+      }
+
+      // markdown.js only starts a list after a blank line, and bare "(1) …"
+      // Implementation lines have no list marker — both would merge into one
+      // paragraph. Same normalization as the overlay (llm-response.html).
+      function normalizeLists(text) {
+        const listItem = /^\s*(\d+[.)]|[-*+])\s+/;
+        const out = [];
+        let inFence = false;
+        text.split('\n').forEach(rawLine => {
+          let line = rawLine;
+          if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
+          else if (!inFence && /^\s*(\*\*)?\(\d+[a-z]?\)/.test(line)) line = '- ' + line.trimStart();
+          const prev = out.length ? out[out.length - 1] : '';
+          if (!inFence && listItem.test(line) && prev.trim() && !listItem.test(prev) && !/^\s/.test(prev)) out.push('');
+          out.push(line);
+        });
+        return out.join('\n');
+      }
+
       // Markdown formatter using markdown.js library
       function formatMarkdown(text) {
         if (!text) return '';
-        
+        text = normalizeLists(text);
+
         try {
           if (typeof markdown !== 'undefined' && markdown.toHTML) {
             return window.renderWithTables ? window.renderWithTables(text, t => markdown.toHTML(t)) : markdown.toHTML(text);
@@ -996,6 +1366,7 @@
 
       // Show thinking indicator
       function showThinkingIndicator() {
+        hideThinkingIndicator(); // one spinner at a time
         const thinkingDiv = document.createElement('div');
         thinkingDiv.className = 'message assistant thinking';
         thinkingDiv.id = 'thinking-indicator';
@@ -1116,19 +1487,6 @@
         }
       }
 
-      // Helpers to capture AI response into chat (text + snippets)
-      function extractCodeBlocks(text) {
-        if (!text) return [];
-        const blocks = [];
-        const regex = /(```|~~~)([^\n]*)\n([\s\S]*?)\1/g; // supports ```lang and ~~~lang
-        let match;
-        while ((match = regex.exec(text)) !== null) {
-          const info = (match[2] || '').trim();
-          const langToken = info.split(/\s+/)[0] || 'text';
-          blocks.push({ language: langToken, code: match[3], fullMatch: match[0], index: match.index });
-        }
-        return blocks;
-      }
       function escapeHtml(str) {
         const div = document.createElement('div');
         div.textContent = str ?? '';
@@ -1211,34 +1569,6 @@
           saveHistory();
         }
       }
-      function renderAssistantResponse(response) {
-        if (!response || typeof response !== 'string') return;
-        // Deduplication: avoid processing the same response twice
-        const normalized = response.trim();
-        const h = hashString(normalized);
-        if (recentResponseHashes.has(h)) return;
-        recentResponseHashes.add(h);
-        if (recentResponseHashes.size > RECENT_HASH_LIMIT) {
-          const first = recentResponseHashes.values().next().value;
-          recentResponseHashes.delete(first);
-        }
-
-        // In answer order: each explanation, then the code block it
-        // introduces (so an optimized solution's text precedes its own code).
-        const blocks = extractCodeBlocks(response);
-        const addText = (t) => {
-          const cleaned = t.replace(/\n\s*\n\s*\n/g, '\n\n').trim();
-          if (cleaned.length) addMessage(cleaned, 'assistant');
-        };
-        let cursor = 0;
-        blocks.forEach(b => {
-          addText(response.slice(cursor, b.index));
-          addCodeSnippet(b.language, b.code);
-          cursor = b.index + b.fullMatch.length;
-        });
-        addText(response.slice(cursor));
-      }
-
       // Basic IPC Event Listeners - simplified
       
       // Listen for transcription events
@@ -1292,12 +1622,186 @@
         });
 
         // Replace transcription LLM handler to store text + snippets
-        whysperAPI.onTranscriptionLlmResponse((event, data) => {
-          if (data && data.response) {
-            try { hideThinkingIndicator(); } catch (_) {}
-            renderAssistantResponse(data.response);
-          }
+        whysperAPI.onTranscriptionLlmResponse((event, data) => markAnswered(data));
+      }
+
+      // ── Model status line ──
+      const modelDot = document.getElementById('modelDot');
+      const modelStatusText = document.getElementById('modelStatusText');
+      const modelRetryBtn = document.getElementById('modelRetryBtn');
+      let modelStatus = null;
+      let modelStatusAt = 0; // local time the status arrived (for countdowns)
+      const SKIP_REASONS = {
+        'overloaded': 'overloaded',
+        'silent': 'not responding',
+        'daily-quota': 'out of daily quota',
+        'minute-quota': 'rate-limited',
+        'retired': 'unavailable'
+      };
+      const shortModel = (m) => String(m || '').replace(/^gemini-/, '');
+      function inText(ms) {
+        if (ms <= 0) return 'soon';
+        const min = Math.round(ms / 60000);
+        if (min < 1) return 'in <1m';
+        if (min < 90) return `in ${min}m`;
+        return `in ${Math.round(min / 60)}h`;
+      }
+      // Deep reasoning / Optimized chain: shown only while its primary is
+      // skipped, so a Deep click's model is known before clicking.
+      function deepSuffix(st, nowServer) {
+        const r = st.reasoning;
+        if (!r || !r.primary) return '';
+        const skip = (r.skipped || []).find(x => x.model === r.primary);
+        if (!skip) return '';
+        const probing = (st.probing || []).includes(r.primary);
+        const when = probing ? 'checking now…'
+          : skip.awaitingProbe ? 'checking soon'
+          : `next check ${inText(skip.until - nowServer)}`;
+        const using = r.next && r.next !== r.primary ? `using ${shortModel(r.next)}, ` : '';
+        return ` · Deep: ${using}${shortModel(r.primary)} ${SKIP_REASONS[skip.reason] || skip.reason}, ${when}`;
+      }
+      function renderModelStatus() {
+        const st = modelStatus;
+        if (!st || !st.primary) {
+          modelDot.className = 'model-dot';
+          modelStatusText.textContent = 'Model: not configured';
+          modelRetryBtn.hidden = true;
+          return;
+        }
+        const nowServer = st.now + (Date.now() - modelStatusAt);
+        const primary = st.primary;
+        const skip = (st.skipped || []).find(x => x.model === primary);
+        const probing = (st.probing || []).includes(primary);
+        const tooltip = [`Primary: ${primary}`, `Backups: ${(st.chain || []).slice(1).join(', ') || 'none'}`];
+        if (st.lastUsed) tooltip.push(`Last answer: ${st.lastUsed}`);
+        if (st.primaryChecked) tooltip.push(`Last check of ${shortModel(primary)}: ${st.primaryChecked.ok ? `answered in ${(st.primaryChecked.ms / 1000).toFixed(1)}s` : 'failed'}`);
+        if (st.reasoning && st.reasoning.primary) {
+          const rc = st.reasoning.primaryChecked;
+          tooltip.push(`Deep reasoning: ${shortModel(st.reasoning.next || st.reasoning.primary)} (primary ${shortModel(st.reasoning.primary)}${rc ? `, last check ${rc.ok ? `answered in ${(rc.ms / 1000).toFixed(1)}s` : 'failed'}` : ''})`);
+        }
+        modelBar.title = tooltip.join(' · ');
+        const deep = deepSuffix(st, nowServer);
+
+        if (!skip) {
+          const checked = st.primaryChecked && st.primaryChecked.ok;
+          modelDot.className = 'model-dot ' + (probing && !checked ? 'warn' : 'ok');
+          modelStatusText.textContent = (probing && !checked ? `Checking ${shortModel(primary)}…` : shortModel(primary)) + deep;
+          modelRetryBtn.hidden = true;
+          return;
+        }
+        const reason = SKIP_REASONS[skip.reason] || skip.reason;
+        const when = probing ? 'checking now…'
+          : skip.awaitingProbe ? 'checking soon'
+          : `next check ${inText(skip.until - nowServer)}`;
+        const using = st.next && st.next !== primary ? `Using ${shortModel(st.next)} · ` : '';
+        modelDot.className = 'model-dot ' + (st.next && st.next !== primary ? 'warn' : 'bad');
+        modelStatusText.textContent = `${using}${shortModel(primary)} ${reason}, ${when}${deep}`;
+        modelRetryBtn.textContent = probing ? 'Checking…' : `Try ${shortModel(primary)} now`;
+        modelRetryBtn.disabled = probing;
+        modelRetryBtn.hidden = false;
+      }
+      function applyModelStatus(st) {
+        if (!st) return;
+        modelStatus = st;
+        modelStatusAt = Date.now();
+        renderModelStatus();
+      }
+      const modelBar = document.getElementById('modelBar');
+      if (whysperAPI && whysperAPI.onModelStatus) {
+        whysperAPI.onModelStatus((_e, st) => applyModelStatus(st));
+      }
+      if (whysperAPI && whysperAPI.getModelStatus) {
+        whysperAPI.getModelStatus().then(applyModelStatus).catch(() => {});
+      }
+      setInterval(() => { if (modelStatus) renderModelStatus(); }, 15000);
+      if (modelRetryBtn) {
+        modelRetryBtn.addEventListener('click', () => {
+          if (!whysperAPI || !whysperAPI.probeModel || !modelStatus) return;
+          modelRetryBtn.disabled = true;
+          modelRetryBtn.textContent = 'Checking…';
+          whysperAPI.probeModel(modelStatus.primary).catch(() => {}).finally(() => {
+            if (whysperAPI.getModelStatus) whysperAPI.getModelStatus().then(applyModelStatus).catch(() => {});
+          });
         });
+      }
+
+      // System design round mode. Main owns the state (src/core/system-design.js)
+      // and broadcasts every change; this only renders it. Requirements come
+      // from the hidden REQ: block of each answer while gathering; "Build
+      // design" asks for the design (reasoning models) from them.
+      const sdCard = document.getElementById('sdCard');
+      let sdState = null;
+      let sdBuilding = false;
+      const SD_SECTIONS = [
+        ['confirmed', 'Confirmed'],
+        ['assuming', 'Assuming (not confirmed yet)'],
+        ['edge', 'Edge cases'],
+        ['out', 'Out of scope'],
+        ['next', 'Ask next'],
+      ];
+      function renderSystemDesign(st) {
+        if (!st) return;
+        const wasBuilt = sdState && sdState.stage === 'built' && sdState.hasDesign;
+        // Back to gathering after a build started = the build failed.
+        if (sdState && sdState.stage === 'built' && st.stage === 'clarify') sdBuilding = false;
+        sdState = st;
+        if (!sdCard) return;
+        sdCard.hidden = !st.on;
+        if (!st.on) { sdCard.innerHTML = ''; return; }
+        if (st.hasDesign && !wasBuilt) sdBuilding = false;
+        const req = st.requirements || {};
+        const built = st.stage === 'built';
+        let html = `<div class="sd-card-head"><span class="sd-card-title">🏗 System design round</span><span class="sd-stage">${
+          built ? (st.hasDesign ? 'Design built — follow-ups update it' : 'Building the design…') : 'Gathering requirements — no drawing yet'
+        }</span><div class="sd-actions"></div></div>`;
+        if (st.problem) html += `<div class="sd-problem"><b>Problem:</b> ${escapeHtml(st.problem)}</div>`;
+        const any = SD_SECTIONS.some(([k]) => req[k] && req[k].length);
+        if (!any) {
+          html += `<div class="sd-empty">${built ? 'No requirements were gathered.' : 'Waiting for the problem statement — the interviewer\'s first design question starts the list. Build design unlocks then.'}</div>`;
+        }
+        SD_SECTIONS.forEach(([key, label]) => {
+          const items = req[key] || [];
+          if (!items.length) return;
+          html += `<div class="sd-section"><div class="sd-section-label">${label}</div><ul>${
+            items.map(t => `<li>${escapeHtml(t)}</li>`).join('')
+          }</ul></div>`;
+        });
+        sdCard.innerHTML = html;
+        const actions = sdCard.querySelector('.sd-actions');
+        if (!built) {
+          const build = document.createElement('button');
+          build.type = 'button';
+          build.className = 'sd-chip primary';
+          build.id = 'sdBuildBtn';
+          build.textContent = sdBuilding ? 'Building…' : '✅ Build design';
+          // Nothing to build before the interviewer has given the problem:
+          // an empty build made the model invent one (2026-10-11).
+          const ready = !!st.problem;
+          build.title = ready
+            ? 'Design it now from these requirements (API, data model, diagram) on the deep-reasoning models'
+            : 'Available once the interviewer gives the design problem';
+          build.disabled = sdBuilding || !ready;
+          build.addEventListener('click', () => {
+            if (build.disabled || !whysperAPI || !whysperAPI.buildSystemDesign) return;
+            sdBuilding = true;
+            build.disabled = true;
+            build.textContent = 'Building…';
+            addMessage('✅ Build design', 'user');
+            setTimeout(() => { showThinkingIndicator(); }, 300);
+            whysperAPI.buildSystemDesign().catch(() => {});
+          });
+          actions.appendChild(build);
+        }
+      }
+      if (whysperAPI && whysperAPI.onSystemDesignState) {
+        whysperAPI.onSystemDesignState((_e, st) => renderSystemDesign(st));
+      }
+      if (whysperAPI && whysperAPI.getSystemDesignState) {
+        whysperAPI.getSystemDesignState().then(renderSystemDesign).catch(() => {});
+      }
+      // A failed build comes back as an error: the button is usable again.
+      if (whysperAPI && whysperAPI.onLlmError) {
+        whysperAPI.onLlmError(() => { if (sdBuilding) { sdBuilding = false; renderSystemDesign(sdState); } });
       }
 
       // UI Event Listeners
@@ -1414,37 +1918,53 @@
         const pending = attachments;
         if (!text && !pending.length) return;
 
-        if (pending.length) {
-          const label = `📎 ${pending.length} screenshot${pending.length > 1 ? 's' : ''}`;
-          addMessage(text ? `${label}\n${text}` : label, 'user');
-        } else {
-          addMessage(text, 'user');
-        }
         messageInput.value = '';
         autoGrow(messageInput);
+        const spoken = inputFromMic;
+        inputFromMic = false;
+        if (!pending.length) return sendText(text, { spoken });
+
+        const label = `📎 ${pending.length} screenshot${pending.length > 1 ? 's' : ''}`;
+        addMessage(text ? `${label}\n${text}` : label, 'user');
+        messageInput.placeholder = DEFAULT_PLACEHOLDER;
 
         // Show thinking indicator after user message
         setTimeout(() => { showThinkingIndicator(); }, 300);
 
         try {
-          if (pending.length) {
-            attachments = [];
-            renderAttachments();
-            const images = await Promise.all(pending.map(async att => ({
-              data: await att.file.arrayBuffer(),
-              mimeType: att.file.type
-            })));
-            pending.forEach(att => URL.revokeObjectURL(att.url));
-            const result = whysperAPI && whysperAPI.sendChatAttachments
-              ? await whysperAPI.sendChatAttachments({ text, images })
-              : { ok: false, error: 'Attachments are not available.' };
-            if (!result || !result.ok) {
-              hideThinkingIndicator();
-              addMessage((result && result.error) || 'Failed to send the screenshots.', 'error');
-            }
-          } else if (whysperAPI && whysperAPI.sendChatMessage) {
+          attachments = [];
+          renderAttachments();
+          const images = await Promise.all(pending.map(async att => ({
+            data: await att.file.arrayBuffer(),
+            mimeType: att.file.type
+          })));
+          pending.forEach(att => URL.revokeObjectURL(att.url));
+          const result = whysperAPI && whysperAPI.sendChatAttachments
+            ? await whysperAPI.sendChatAttachments({ text, images })
+            : { ok: false, error: 'Attachments are not available.' };
+          if (!result || !result.ok) {
+            hideThinkingIndicator();
+            addMessage((result && result.error) || 'Failed to send the screenshots.', 'error');
+          }
+        } catch (error) {
+          console.error('Failed to send chat message to main process:', error);
+        }
+      }
+
+      // A text message, typed or a clicked "Did you mean" guess. It is the
+      // reply to a pending "Did you mean …?", so the guesses are spent.
+      async function sendText(text, { spoken = false } = {}) {
+        addMessage(text, 'user');
+        disableSuggestions();
+        messageInput.placeholder = DEFAULT_PLACEHOLDER;
+
+        // Show thinking indicator after user message
+        setTimeout(() => { showThinkingIndicator(); }, 300);
+
+        try {
+          if (whysperAPI && whysperAPI.sendChatMessage) {
             // Send to main process for session memory storage and LLM processing
-            await whysperAPI.sendChatMessage(text);
+            await whysperAPI.sendChatMessage(text, { spoken });
           }
         } catch (error) {
           console.error('Failed to send chat message to main process:', error);
@@ -1464,7 +1984,10 @@
       }
       if (messageInput) {
         autoGrow(messageInput);
-        messageInput.addEventListener('input', () => autoGrow(messageInput));
+        messageInput.addEventListener('input', () => {
+          autoGrow(messageInput);
+          if (!messageInput.value.trim()) inputFromMic = false; // cleared → typed from scratch
+        });
       }
 
       // Replace keypress with keydown to support Shift+Enter for newline and Enter to send

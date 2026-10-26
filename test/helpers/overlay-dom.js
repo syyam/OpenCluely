@@ -7,7 +7,9 @@ const { JSDOM, VirtualConsole } = require('jsdom');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
-async function loadOverlay() {
+// options.beforeParse(window): extra setup before the page's scripts run
+// (e.g. a window.mermaid stub for the diagram tests).
+async function loadOverlay({ beforeParse = null } = {}) {
   const listeners = {};
   const calls = [];
   const errors = [];
@@ -36,6 +38,7 @@ async function loadOverlay() {
       window.electronAPI = api;
       window.scrollTo = () => {};
       window.HTMLElement.prototype.scrollIntoView = function () {};
+      if (typeof beforeParse === 'function') beforeParse(window);
     },
   });
   await new Promise((resolve) => {

@@ -131,7 +131,8 @@
       }
 
       /* Small round Japanese-romaji-mode toggle button */
-      #japaneseModeButton {
+      #japaneseModeButton,
+      #systemDesignButton {
         width: 26px;
         height: 26px;
         border-radius: 9999px;
@@ -141,24 +142,28 @@
         padding: 0;
         flex-shrink: 0;
       }
-      #japaneseModeButton i {
+      #japaneseModeButton i,
+      #systemDesignButton i {
         font-size: 12px;
         font-style: normal;
         font-weight: 700;
       }
-      #japaneseModeButton:hover {
+      #japaneseModeButton:hover,
+      #systemDesignButton:hover {
         background: rgba(96, 165, 250, 0.18);
         color: #93c5fd;
         box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.25) inset;
       }
       /* Unambiguous on-state — a filled background, not just a text-color
          change, so it's never unclear at a glance whether it's active. */
-      #japaneseModeButton.active {
+      #japaneseModeButton.active,
+      #systemDesignButton.active {
         background: rgba(76, 175, 80, 0.25);
         color: #4caf50;
         box-shadow: 0 0 0 1px rgba(76, 175, 80, 0.4) inset;
       }
-      #japaneseModeButton.active:hover {
+      #japaneseModeButton.active:hover,
+      #systemDesignButton.active:hover {
         background: rgba(76, 175, 80, 0.35);
       }
 
@@ -418,6 +423,9 @@
       <div class="command-separator"></div>
       <div class="command-item" id="japaneseModeButton" title="Japanese (romaji) response mode">
         <i>JP</i>
+      </div>
+      <div class="command-item" id="systemDesignButton" title="System design round: gather requirements, then Build design (in chat) draws the diagrams. Off pauses the round; clear history starts a new one.">
+        <i class="fas fa-sitemap"></i>
       </div>
       <div class="command-separator"></div>
       <div class="command-item" id="settingsIndicator" title="Settings (resume profile, response language, API key)">

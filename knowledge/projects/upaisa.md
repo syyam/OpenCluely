@@ -1,3 +1,4 @@
+topic: upaisa, u paisa, abacus
 <!-- uPaisa project knowledge. No architecture document was provided, so this
 holds only facts already in the resume / interview notes. Extend it with
 confirmed details; never let Gemini invent beyond them. -->

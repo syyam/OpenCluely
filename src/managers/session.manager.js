@@ -192,9 +192,19 @@ class SessionManager {
    * Get conversation history for LLM context
    */
   getConversationHistory(maxEntries = 20) {
-    // Get recent conversation events (excluding system initialization)
-    const conversationEvents = this.sessionMemory
-      .filter(event => event.role !== 'system' || !event.metadata?.isInitialization)
+    // Only real question/answer turns count toward the window: system events
+    // (profile switches, errors, "Application started") and canned fallback
+    // replies ("could you repeat…") with their question are dropped BEFORE
+    // slicing, so they no longer take the place of real turns.
+    const turns = this.sessionMemory.filter(event =>
+      (event.role === 'user' || event.role === 'model') &&
+      typeof event.content === 'string' && event.content.trim().length > 0);
+    const conversationEvents = turns
+      .filter((event, i) => {
+        if (event.role === 'model') return !event.metadata?.usedFallback;
+        const next = turns[i + 1];
+        return !(next && next.role === 'model' && next.metadata?.usedFallback);
+      })
       .slice(-maxEntries);
 
     return conversationEvents.map(event => ({

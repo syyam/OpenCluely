@@ -1049,7 +1049,12 @@ class SpeechService extends EventEmitter {
     }
     const enterThreshold = Math.max(floor, this.micVadNoiseFloor * 2.5);
     const exitThreshold = Math.max(floor * 0.7, this.micVadNoiseFloor * 1.6);
-    const isVoiced = this.micVadSpeaking ? energy >= exitThreshold : energy >= enterThreshold;
+    const threshold = this.micVadSpeaking ? exitThreshold : enterThreshold;
+    const loudEnough = energy >= threshold;
+    // Loud but spiky (keyboard clicks) is not voice: it neither starts nor
+    // extends an utterance.
+    const clicks = loudEnough && !this._isSustainedSound(buffer, threshold);
+    const isVoiced = loudEnough && !clicks;
 
     if (!this.micVadSpeaking) {
       if (isVoiced) {
@@ -1066,7 +1071,11 @@ class SpeechService extends EventEmitter {
         this.micSegmentBytes += buffer.length;
         this.micVadSpeechMs += chunkMs;
       } else {
-        this.micVadNoiseFloor = this.micVadNoiseFloor * 0.95 + energy * 0.05;
+        // Typing bursts don't raise the noise floor, or speech right after
+        // a burst of typing would need to be louder to be heard.
+        if (!clicks) {
+          this.micVadNoiseFloor = this.micVadNoiseFloor * 0.95 + energy * 0.05;
+        }
         this.micVadPreRoll.push(buffer);
         this.micVadPreRollMs += chunkMs;
         const preRollLimit = this._getPreRollMs();
@@ -1543,6 +1552,36 @@ class SpeechService extends EventEmitter {
 
   _getVadEnergyFloor() {
     return this._vadNumber('whisperVadEnergyFloor', 'WHISPER_VAD_ENERGY_FLOOR', 'speech.whisper.vadEnergyFloor', 0.008, 0.0005);
+  }
+
+  // My Microphone only: share of 16 ms sub-frames that must be above the
+  // threshold for a chunk to count as voice (see _isSustainedSound).
+  _getMicVoicedSubframeRatio() {
+    return Math.min(1, this._vadNumber('micVoicedSubframeRatio', 'MIC_VOICED_SUBFRAME_RATIO', 'speech.whisper.micVoicedSubframeRatio', 0.4, 0));
+  }
+
+  /**
+   * A mic chunk is 256 ms. Its RMS can clear the voice threshold from a few
+   * loud key clicks alone, and Whisper then invents a sentence for them
+   * (2026-09-29: "and then, we'll see you next time", "v-f-r-r-r…"). Speech
+   * keeps the energy up across most of the chunk; typing is short spikes
+   * with quiet between them. So: split into 16 ms sub-frames and require a
+   * share of them to be above the threshold.
+   */
+  _isSustainedSound(buffer, threshold) {
+    const SUBFRAME_BYTES = 512; // 16 ms at 16 kHz mono 16-bit
+    const frames = Math.floor(buffer.length / SUBFRAME_BYTES);
+    if (frames < 4) {
+      return true; // too short to judge; keep the plain energy decision
+    }
+    let loud = 0;
+    for (let f = 0; f < frames; f++) {
+      const start = f * SUBFRAME_BYTES;
+      if (this._chunkRmsEnergy(buffer.subarray(start, start + SUBFRAME_BYTES)) >= threshold) {
+        loud++;
+      }
+    }
+    return loud / frames >= this._getMicVoicedSubframeRatio();
   }
 
   _getSetting(key) {
@@ -2133,7 +2172,8 @@ class SpeechService extends EventEmitter {
     // Hyphens are treated as word separators too, not just stripped — a
     // hallucinated "T-T-T-T-T..." loop has no whitespace at all otherwise,
     // which would hide it from the repetition check below (single "word").
-    const normalized = text.toLowerCase().replace(/[\s.,!?¡¿"'`-]+/g, ' ').trim();
+    const normalize = (t) => t.toLowerCase().replace(/[\s.,!?¡¿"'`-]+/g, ' ').trim();
+    const normalized = normalize(text);
     if (!normalized) {
       return 'empty';
     }
@@ -2153,6 +2193,11 @@ class SpeechService extends EventEmitter {
       'so',
       'the end',
       'subtitles by the amara org community',
+      // Video-outro hallucinations on keyboard noise (2026-09-29).
+      "and then we'll see you next time",
+      "we'll see you next time",
+      'see you next time',
+      'see you in the next video',
       // Japanese counterparts of the same subtitle/outro hallucination
       // family — needed now that 'ja' is an allowed transcript language
       // (see ALLOWED_TRANSCRIPT_LANGUAGES below), otherwise this exact
@@ -2164,7 +2209,7 @@ class SpeechService extends EventEmitter {
       'チャンネル登録をお願いします',
       'チャンネル登録よろしくお願いします',
       '最後までご視聴いただきありがとうございました'
-    ]);
+    ].map(normalize)); // compared the same way as the transcript
     if (HALLUCINATIONS.has(normalized)) {
       return 'stock_phrase';
     }
@@ -2245,6 +2290,24 @@ class SpeechService extends EventEmitter {
       const coveredWords = repeats * unitLen;
       if (repeats >= minRepeats && coveredWords / words.length >= 0.7) {
         return true;
+      }
+    }
+
+    // The loop can also start after a few other words ("e mounted v f r r r
+    // r…", "и в for в for…", "…is the one the one the one…"), which the
+    // check above misses because it only looks from the first word: a short
+    // unit repeated 5+ times in a row anywhere, covering half the text.
+    for (let unitLen = 1; unitLen <= 3; unitLen++) {
+      for (let start = 0; start + unitLen * 5 <= words.length; start++) {
+        const unit = words.slice(start, start + unitLen).join(' ');
+        let repeats = 1;
+        for (let i = start + unitLen; i + unitLen <= words.length; i += unitLen) {
+          if (words.slice(i, i + unitLen).join(' ') !== unit) break;
+          repeats++;
+        }
+        if (repeats >= 5 && (repeats * unitLen) / words.length >= 0.5) {
+          return true;
+        }
       }
     }
 

@@ -45,3 +45,16 @@ test('history window returns the most recent entries', () => {
   const h = session.getConversationHistory(4);
   assert.deepEqual(h.map(e => e.content), ['Q11', 'A11', 'Q12', 'A12']);
 });
+
+test('system events and canned fallback pairs no longer take history slots', () => {
+  session.addUserInput('Q1');
+  session.addModelResponse('A1');
+  session.setActiveSkill('android');                       // system event
+  session.addEvent('Application started');                 // plain event
+  session.addConversationEvent({ role: 'system', content: 'LLM processing failed: 503', action: 'llm_error' });
+  session.addUserInput('garbled question', 'speech');
+  session.addModelResponse('Could you repeat that?', { usedFallback: true });
+  session.addUserInput('Q2');
+  session.addModelResponse('A2');
+  assert.deepEqual(session.getConversationHistory(4).map(e => e.content), ['Q1', 'A1', 'Q2', 'A2']);
+});
